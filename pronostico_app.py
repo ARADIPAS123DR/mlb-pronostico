@@ -1768,78 +1768,64 @@ def _batting_risp_from_statcast(raw: pd.DataFrame, min_pa: int = 10) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cargar_hot_hitters(team_id: int, dias: int = 14) -> list:
-    """Top 5 bateadores por wOBA calculado para el equipo en los últimos `dias` días.
-    Agrega todas las entradas por jugador (el API puede devolver una por juego).
-    Mín. 2 PA totales para aparecer (permite inicio de temporada)."""
+    """Top 5 bateadores por wOBA en los últimos `dias` días. Mín. 5 PA.
+    La API byDateRange devuelve una fila acumulada por jugador para el rango."""
     if not team_id:
         return []
     today    = date.today()
     start_dt = today - timedelta(days=dias)
 
-    def _fetch_splits(s_date, e_date):
+    def _fetch(s_date, e_date, season):
         try:
             url = (
                 "https://statsapi.mlb.com/api/v1/stats"
                 f"?stats=byDateRange&group=hitting"
                 f"&startDate={s_date}&endDate={e_date}"
-                f"&sportId=1&gameType=R&teamId={team_id}&limit=500"
+                f"&season={season}&sportId=1&gameType=R"
+                f"&teamId={team_id}&limit=300"
             )
             r = _req_http.get(url, timeout=15)
             r.raise_for_status()
-            return r.json().get("stats", [{}])[0].get("splits", [])
+            data = r.json().get("stats", [])
+            if not data:
+                return []
+            return data[0].get("splits", [])
         except Exception:
             return []
 
-    splits = _fetch_splits(start_dt, today)
+    def _splits_to_rows(splits):
+        rows = []
+        for sp in splits:
+            s   = sp.get("stat", {})
+            pa  = int(s.get("plateAppearances", 0))
+            if pa < 5:
+                continue
+            ab      = int(s.get("atBats", 0))
+            bb      = int(s.get("baseOnBalls", 0))
+            hbp     = int(s.get("hitByPitch", 0))
+            hits    = int(s.get("hits", 0))
+            d2      = int(s.get("doubles", 0))
+            d3      = int(s.get("triples", 0))
+            hr      = int(s.get("homeRuns", 0))
+            sf      = int(s.get("sacFlies", 0))
+            singles = max(0, hits - d2 - d3 - hr)
+            denom   = ab + bb + hbp + sf
+            woba    = round(
+                (0.69*bb + 0.72*hbp + 0.89*singles + 1.27*d2 + 1.62*d3 + 2.10*hr) / denom, 3
+            ) if denom > 0 else 0.0
+            ops = float(s.get("ops", 0) or 0)
+            rows.append({
+                "Bateador": sp.get("player", {}).get("fullName", "—"),
+                "PA":   pa,
+                "wOBA": woba,
+                "OPS":  round(ops, 3),
+                "HR":   hr,
+            })
+        return sorted(rows, key=lambda x: x["wOBA"], reverse=True)[:5]
 
-    # Agregar por jugador (el API puede devolver una entrada por juego)
-    from collections import defaultdict
-    player_totals: dict = defaultdict(lambda: {
-        "name": "—", "pa": 0, "ab": 0, "bb": 0, "hbp": 0,
-        "hits": 0, "d2": 0, "d3": 0, "hr": 0, "sf": 0, "ops_sum": 0.0, "ops_n": 0,
-    })
-    for sp in splits:
-        pid  = sp.get("player", {}).get("id", 0)
-        name = sp.get("player", {}).get("fullName", "—")
-        s    = sp.get("stat", {})
-        t    = player_totals[pid]
-        t["name"]    = name
-        t["pa"]     += int(s.get("plateAppearances", 0))
-        t["ab"]     += int(s.get("atBats", 0))
-        t["bb"]     += int(s.get("baseOnBalls", 0))
-        t["hbp"]    += int(s.get("hitByPitch", 0))
-        t["hits"]   += int(s.get("hits", 0))
-        t["d2"]     += int(s.get("doubles", 0))
-        t["d3"]     += int(s.get("triples", 0))
-        t["hr"]     += int(s.get("homeRuns", 0))
-        t["sf"]     += int(s.get("sacFlies", 0))
-        _ops = float(s.get("ops", 0) or 0)
-        if _ops > 0:
-            t["ops_sum"] += _ops
-            t["ops_n"]   += 1
-
-    rows = []
-    for pid, t in player_totals.items():
-        pa = t["pa"]
-        if pa < 2:          # mín. 2 PA totales (inicio de temporada)
-            continue
-        ab      = t["ab"]; bb = t["bb"]; hbp = t["hbp"]
-        hits    = t["hits"]; d2 = t["d2"]; d3 = t["d3"]; hr = t["hr"]; sf = t["sf"]
-        singles = max(0, hits - d2 - d3 - hr)
-        denom   = ab + bb + hbp + sf
-        woba    = round(
-            (0.69*bb + 0.72*hbp + 0.89*singles + 1.27*d2 + 1.62*d3 + 2.10*hr) / denom, 3
-        ) if denom > 0 else 0.0
-        ops = round(t["ops_sum"] / t["ops_n"], 3) if t["ops_n"] > 0 else 0.0
-        rows.append({
-            "Bateador": t["name"],
-            "PA":   pa,
-            "wOBA": woba,
-            "OPS":  ops,
-            "HR":   hr,
-        })
-
-    return sorted(rows, key=lambda x: x["wOBA"], reverse=True)[:5]
+    season = today.year
+    splits = _fetch(start_dt.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d"), season)
+    return _splits_to_rows(splits)
 
 
 # ── WAR líderes por equipo (FanGraphs via pybaseball) ────────────────────────
