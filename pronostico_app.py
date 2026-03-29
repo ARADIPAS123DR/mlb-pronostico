@@ -11,7 +11,15 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import requests as _req_http
+import re
+import unicodedata
 from datetime import datetime, date, timedelta
+
+try:
+    from bs4 import BeautifulSoup as _BeautifulSoup
+    HAS_BS4 = True
+except ImportError:
+    HAS_BS4 = False
 
 try:
     import pybaseball
@@ -366,6 +374,44 @@ def _stats_agregadas(df: pd.DataFrame) -> dict:
         "ER/9": round(ter / ti * 9, 2) if ti > 0 else 0.0,
         "IP":   round(ti, 1),
     }
+
+
+# =============================================================================
+# FUNCIÓN: Saves y Holds — temporada (MLB Stats API)
+# =============================================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_saves_holds_season() -> pd.DataFrame:
+    """Descarga saves y holds de la temporada desde el MLB Stats API."""
+    season = date.today().year
+    url = (
+        "https://statsapi.mlb.com/api/v1/stats"
+        f"?stats=season&group=pitching&season={season}"
+        "&sportId=1&playerPool=All&limit=3000"
+    )
+    try:
+        r = _req_http.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        splits = (data.get("stats") or [{}])[0].get("splits", [])
+        rows = []
+        for split in splits:
+            stat        = split.get("stat", {})
+            team_info   = split.get("team", {})
+            player_info = split.get("player", {})
+            team_abbr   = team_info.get("abbreviation", "")
+            team_abbr   = SC_TO_INT.get(team_abbr, team_abbr)
+            rows.append({
+                "pitcher_id":   player_info.get("id"),
+                "pitcher_name": player_info.get("fullName", ""),
+                "team":         team_abbr,
+                "SV":           int(stat.get("saves", 0) or 0),
+                "HLD":          int(stat.get("holds", 0) or 0),
+                "SVO":          int(stat.get("saveOpportunities", 0) or 0),
+            })
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 
 # =============================================================================
@@ -778,7 +824,7 @@ def tab_bullpen_liga():
                             "FIP_disp": "FIP (disp)", "K%_disp": "K% (disp)",
                             "BB%_disp": "BB% (disp)", "wOBA_disp": "wOBA (disp)",
                         })
-                        .set_index("Rank")
+                        .set_index(["Rank", "Nombre"])
                         .round({c: 2 for c in ["FIP (disp)","K% (disp)","BB% (disp)","wOBA (disp)"]}))
         st.dataframe(
             df_show_disp.style.apply(_color_row_disp, axis=1),
@@ -816,7 +862,7 @@ def tab_bullpen_liga():
                      "WHIP", "wOBA", "ER/9", "Disp", "Limit", "NDisp", "Disp%"]
         _rc2_main = {c: 2 for c in ["IP","K%","BB%","FIP","WHIP","wOBA","ER/9"] if c in df_liga.columns}
         df_show = (df_liga[[c for c in cols_show if c in df_liga.columns]]
-                   .set_index("Rank")
+                   .set_index(["Rank", "Nombre"])
                    .round(_rc2_main))
         st.dataframe(
             df_show.style.apply(_color_row, axis=1),
@@ -2042,6 +2088,94 @@ def cargar_ranking_starters_mes() -> pd.DataFrame:
     return df
 
 
+# =============================================================================
+# ARTÍCULO EXTERNO — Fetch & parse de análisis de pitchers
+# =============================================================================
+
+def _normalizar_nombre(nombre: str) -> str:
+    """Quita tildes y pasa a minúsculas para comparaciones."""
+    nfkd = unicodedata.normalize("NFKD", nombre)
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower().strip()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fetch_article_pitcher_info(url: str) -> dict:
+    """
+    Descarga el artículo del URL y extrae bloques de texto.
+    Devuelve {"blocks": [...], "full_text": "...", "error": ""}.
+    """
+    if not url:
+        return {"blocks": [], "full_text": "", "error": ""}
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        resp = _req_http.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+
+        if HAS_BS4:
+            soup = _BeautifulSoup(resp.text, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                tag.decompose()
+            blocks = []
+            for tag in soup.find_all(["p", "li", "h2", "h3", "h4"]):
+                txt = tag.get_text(separator=" ", strip=True)
+                if len(txt) > 15:
+                    blocks.append(txt)
+        else:
+            # Fallback: regex simple sobre el HTML
+            text = re.sub(r"<[^>]+>", " ", resp.text)
+            text = re.sub(r"\s+", " ", text)
+            blocks = [s.strip() for s in text.split(".") if len(s.strip()) > 30]
+
+        full_text = "\n".join(blocks)
+        return {"blocks": blocks, "full_text": full_text, "error": ""}
+    except Exception as exc:
+        return {"blocks": [], "full_text": "", "error": str(exc)}
+
+
+def _buscar_pitcher_en_articulo(pitcher_name: str, article_data: dict) -> str:
+    """
+    Busca menciones del pitcher en los bloques del artículo.
+    Usa apellido (y opcionalmente nombre) para matching.
+    Devuelve el texto relevante o cadena vacía.
+    """
+    if not article_data or not pitcher_name or pitcher_name == "Por confirmar":
+        return ""
+    blocks = article_data.get("blocks", [])
+    if not blocks:
+        return ""
+
+    partes = pitcher_name.strip().split()
+    apellido = _normalizar_nombre(partes[-1]) if partes else ""
+    nombre   = _normalizar_nombre(partes[0])  if len(partes) > 1 else ""
+
+    relevantes = []
+    for blk in blocks:
+        blk_norm = _normalizar_nombre(blk)
+        # Buscar por apellido completo como palabra
+        if apellido and re.search(r"\b" + re.escape(apellido) + r"\b", blk_norm):
+            relevantes.append(blk)
+
+    # Si hay demasiados hits por apellido muy común, filtrar con nombre también
+    if len(relevantes) > 6 and nombre:
+        filtrados = [b for b in relevantes
+                     if re.search(r"\b" + re.escape(nombre) + r"\b",
+                                  _normalizar_nombre(b))]
+        if filtrados:
+            relevantes = filtrados
+
+    if not relevantes:
+        return ""
+
+    return "\n\n".join(relevantes[:6])
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def cargar_partidos_mlb(fecha: date) -> list:
     try:
@@ -2141,6 +2275,34 @@ def tab_partidos_dia():  # noqa: C901
     c1.metric("Partidos", len(partidos))
     c2.metric("Con starter confirmado", len(partidos) - tbd)
     c3.metric("Por confirmar", tbd)
+
+    # ── Artículo externo de análisis de pitchers ──────────────────────────────
+    with st.container(border=True):
+        st.markdown("##### 📰 Artículo de análisis de pitchers (Pitcher List u otro)")
+        _col_url, _col_btn_art = st.columns([5, 1])
+        with _col_url:
+            _article_url_input = st.text_input(
+                "Link del artículo",
+                value=st.session_state.get("partidos_article_url", ""),
+                key="partidos_article_url_input",
+                placeholder="https://pitcherlist.com/...",
+                label_visibility="collapsed",
+            )
+        with _col_btn_art:
+            _read_btn = st.button("📖 Leer", key="fetch_article_btn", use_container_width=True)
+        if _read_btn:
+            st.session_state["partidos_article_url"] = _article_url_input.strip()
+            st.rerun()
+
+    _active_article_url = st.session_state.get("partidos_article_url", "")
+    _article_data: dict = {}
+    if _active_article_url:
+        with st.spinner("Leyendo artículo..."):
+            _article_data = _fetch_article_pitcher_info(_active_article_url)
+        if _article_data.get("error"):
+            st.warning(f"⚠️ No se pudo leer el artículo: {_article_data['error']}")
+        elif _article_data.get("full_text"):
+            st.caption(f"✅ Artículo cargado — {len(_article_data.get('blocks', []))} bloques de texto extraídos")
 
     # ── Ranking mensual ───────────────────────────────────────────────────────
     with st.spinner("Cargando ranking mensual de iniciadores..."):
@@ -2319,6 +2481,25 @@ def tab_partidos_dia():  # noqa: C901
             if "FB mph" in df_log.columns:
                 _sc = ["Fecha", "Rival", "IP", "FB mph", "K%", "BB%", "ERA", "FIP", "ERA-FIP"]
             st.dataframe(df_log[_sc], use_container_width=True, hide_index=True)
+
+            # ── Texto del artículo externo ────────────────────────────────
+            _art_txt = _buscar_pitcher_en_articulo(pitcher_name, _article_data)
+            if _art_txt:
+                st.markdown(
+                    "<div style='background:#f0f4ff;border-left:4px solid #4a7fd4;"
+                    "padding:10px 14px;border-radius:0 6px 6px 0;margin-top:8px;'>"
+                    "<span style='font-size:0.75rem;font-weight:600;color:#4a7fd4;"
+                    "text-transform:uppercase;letter-spacing:0.05em;'>📰 Pitcher List</span>",
+                    unsafe_allow_html=True,
+                )
+                for _line in _art_txt.split("\n\n"):
+                    if _line.strip():
+                        st.markdown(
+                            f"<p style='font-size:0.85rem;margin:6px 0 0 0;"
+                            f"color:#1a1a2e;'>{_line.strip()}</p>",
+                            unsafe_allow_html=True,
+                        )
+                st.markdown("</div>", unsafe_allow_html=True)
 
     def _bat_card(col, team: str, team_name: str, bat_d: dict,
                   s_rank, n_s, period: str, vs_hand: str):
@@ -3590,6 +3771,236 @@ def tab_pronostico():
 
 
 # =============================================================================
+# TAB 5: BULLPEN USAGE — TODOS LOS EQUIPOS
+# =============================================================================
+
+def tab_bullpen_usage():  # noqa: C901
+    st.markdown("## Bullpen Usage — Todos los Equipos")
+    st.caption(
+        "Stats últimos **17 días** (Statcast) · SV/HLD: temporada completa · "
+        "Uso D-1…D-5: pitcheos por día (verde ≤15 · amarillo ≤30 · rojo >30)"
+    )
+
+    col_btn, col_info = st.columns([1, 4])
+    with col_btn:
+        st.button("Actualizar datos", type="primary", key="bu_refresh")
+
+    today  = date.today()
+    dias_5 = [(today - timedelta(days=i)) for i in range(1, 6)]
+    day_cols   = [f"D-{i}" for i in range(1, 6)]
+    day_labels = {f"D-{i}": (today - timedelta(days=i)).strftime("%m/%d") for i in range(1, 6)}
+
+    # ── Cargar datos ──────────────────────────────────────────────────────────
+    with st.spinner("Descargando Statcast (17 días, todos los equipos)..."):
+        raw_global = cargar_statcast_global(dias=17)
+
+    with st.spinner("Cargando Saves y Holds de la temporada..."):
+        df_svhld = get_saves_holds_season()
+
+    if raw_global.empty:
+        st.error("No se pudo cargar Statcast. Verifica conexión.")
+        return
+
+    # ── Construir datos por pitcher de todos los equipos ──────────────────────
+    team_data: dict[str, pd.DataFrame] = {}
+    progress = st.progress(0, text="Procesando equipos...")
+
+    for i, team in enumerate(MLB_TEAMS):
+        progress.progress((i + 1) / len(MLB_TEAMS), text=f"Procesando {team}...")
+        df_t = _extraer_apariciones_equipo(raw_global, team)
+        if df_t.empty:
+            team_data[team] = pd.DataFrame()
+            continue
+
+        svhld_team = (
+            df_svhld[df_svhld["team"] == team]
+            if not df_svhld.empty and "team" in df_svhld.columns
+            else pd.DataFrame()
+        )
+
+        rows = []
+        for pid, grp in df_t.groupby("pitcher_id"):
+            name  = grp["pitcher_name"].iloc[0]
+            tp    = int(grp["PA"].sum())
+            ti    = float(grp["IP"].sum())
+            tk    = int(grp["K"].sum())
+            tb    = int(grp["BB"].sum())
+            th    = int(grp["H"].sum())
+            thr   = int(grp["HR"].sum())
+            ter   = int(grp["ER"].sum())
+            tw    = float(grp["woba_sum"].sum())
+            g     = grp["game_pk"].nunique()
+            pit17 = int(grp["pitches"].sum())
+
+            uso_5d = {}
+            for d in dias_5:
+                dg = grp[grp["game_date"] == d]
+                uso_5d[d] = int(dg["pitches"].sum()) if not dg.empty else 0
+
+            sv = hld = svo = 0
+            if not svhld_team.empty and "pitcher_id" in svhld_team.columns:
+                p_row = svhld_team[svhld_team["pitcher_id"] == pid]
+                if not p_row.empty:
+                    sv  = int(p_row.iloc[0]["SV"])
+                    hld = int(p_row.iloc[0]["HLD"])
+                    svo = int(p_row.iloc[0]["SVO"])
+
+            row = {
+                "Pitcher": name,
+                "G":       g,
+                "IP":      round(ti, 1),
+                "K%":      round(tk / tp * 100, 1) if tp > 0 else 0.0,
+                "BB%":     round(tb / tp * 100, 1) if tp > 0 else 0.0,
+                "ERA":     round(ter / ti * 9, 2)  if ti > 0 else 0.0,
+                "FIP":     round(max(0.0, (13*thr + 3*tb - 2*tk) / ti + FIP_CONST), 2) if ti > 0 else 4.50,
+                "WHIP":    round((th + tb) / ti, 2) if ti > 0 else 0.0,
+                "wOBA":    round(tw / tp, 3)        if tp > 0 else 0.300,
+                "SV":      sv,
+                "HLD":     hld,
+                "SVO":     svo,
+                "SV+HLD":  sv + hld,
+                "Pit17":   pit17,
+            }
+            for j, d in enumerate(dias_5):
+                row[f"D-{j+1}"] = uso_5d[d]
+
+            rows.append(row)
+
+        if rows:
+            df_team = pd.DataFrame(rows)
+            # Ordenar: primero closers (SV desc), luego setup (HLD desc), luego por FIP
+            df_team = df_team.sort_values(
+                ["SV", "HLD", "FIP"], ascending=[False, False, True]
+            ).reset_index(drop=True)
+            team_data[team] = df_team
+        else:
+            team_data[team] = pd.DataFrame()
+
+    progress.empty()
+
+    # ── Helpers de estilo inline ──────────────────────────────────────────────
+    def _fip_color(v):
+        try:
+            f = float(v)
+            if f < 3.50:   return "color:#155724;font-weight:600"
+            elif f < 4.50: return "color:#856404"
+            else:           return "color:#721c24;font-weight:600"
+        except:
+            return ""
+
+    def _uso_cell(v):
+        try:
+            n = int(v)
+            if n == 0:    return "—", ""
+            elif n <= 15: return str(n), "background:#d4edda"
+            elif n <= 30: return str(n), "background:#fff3cd"
+            else:          return str(n), "background:#f8d7da"
+        except:
+            return str(v), ""
+
+    def _render_team_card(team: str, df: pd.DataFrame):
+        nombre = TEAM_NAMES.get(team, team)
+        sv_tot  = int(df["SV"].sum())
+        hld_tot = int(df["HLD"].sum())
+        pit5_tot = int(df[day_cols].values.sum())
+
+        # Cabecera de la tarjeta
+        st.markdown(
+            f"<div style='background:#0d2137;color:white;padding:6px 10px;"
+            f"border-radius:6px 6px 0 0;font-weight:700;font-size:0.95rem;'>"
+            f"⚾ {team} — {nombre}"
+            f"<span style='float:right;font-size:0.8rem;font-weight:400;'>"
+            f"SV {sv_tot} · HLD {hld_tot} · Pit5d {pit5_tot}</span></div>",
+            unsafe_allow_html=True,
+        )
+
+        if df.empty:
+            st.markdown(
+                "<div style='background:#f8f9fa;padding:8px 10px;"
+                "border:1px solid #dee2e6;border-top:none;border-radius:0 0 6px 6px;"
+                "color:#6c757d;font-size:0.8rem;'>Sin datos</div>",
+                unsafe_allow_html=True,
+            )
+            return
+
+        # Cabecera de columnas
+        hdrs = ["Pitcher", "G", "IP", "K%", "BB%", "ERA", "FIP", "WHIP", "wOBA",
+                "SV", "HLD"] + [day_labels[d] for d in day_cols]
+        hdr_html = "".join(
+            f"<th style='padding:3px 6px;font-size:0.72rem;white-space:nowrap;"
+            f"border-bottom:2px solid #0d2137;text-align:center;'>{h}</th>"
+            for h in hdrs
+        )
+
+        rows_html = ""
+        for idx, r in df.iterrows():
+            # Etiqueta de rol
+            if r["SV"] > 0:
+                role_badge = (
+                    "<span style='background:#0d2137;color:white;border-radius:3px;"
+                    "padding:1px 4px;font-size:0.65rem;margin-right:4px;'>SV</span>"
+                )
+            elif r["HLD"] > 0:
+                role_badge = (
+                    "<span style='background:#5a7a94;color:white;border-radius:3px;"
+                    "padding:1px 4px;font-size:0.65rem;margin-right:4px;'>HLD</span>"
+                )
+            else:
+                role_badge = ""
+
+            fip_style = _fip_color(r["FIP"])
+            bg_row = "#ffffff" if idx % 2 == 0 else "#f8f9fa"
+
+            uso_cells = ""
+            for d in day_cols:
+                txt, bg = _uso_cell(r[d])
+                uso_cells += (
+                    f"<td style='text-align:center;padding:3px 6px;"
+                    f"font-size:0.75rem;{bg}'>{txt}</td>"
+                )
+
+            rows_html += (
+                f"<tr style='background:{bg_row};'>"
+                f"<td style='padding:3px 8px;font-size:0.78rem;white-space:nowrap;'>"
+                f"{role_badge}{r['Pitcher']}</td>"
+                f"<td style='text-align:center;padding:3px 6px;font-size:0.75rem;'>{r['G']}</td>"
+                f"<td style='text-align:center;padding:3px 6px;font-size:0.75rem;'>{r['IP']:.1f}</td>"
+                f"<td style='text-align:center;padding:3px 6px;font-size:0.75rem;'>{r['K%']:.1f}</td>"
+                f"<td style='text-align:center;padding:3px 6px;font-size:0.75rem;'>{r['BB%']:.1f}</td>"
+                f"<td style='text-align:center;padding:3px 6px;font-size:0.75rem;'>{r['ERA']:.2f}</td>"
+                f"<td style='text-align:center;padding:3px 6px;font-size:0.75rem;{fip_style}'>{r['FIP']:.2f}</td>"
+                f"<td style='text-align:center;padding:3px 6px;font-size:0.75rem;'>{r['WHIP']:.2f}</td>"
+                f"<td style='text-align:center;padding:3px 6px;font-size:0.75rem;'>{r['wOBA']:.3f}</td>"
+                f"<td style='text-align:center;padding:3px 6px;font-size:0.75rem;font-weight:600;'>{r['SV']}</td>"
+                f"<td style='text-align:center;padding:3px 6px;font-size:0.75rem;font-weight:600;'>{r['HLD']}</td>"
+                f"{uso_cells}"
+                f"</tr>"
+            )
+
+        table_html = (
+            f"<div style='overflow-x:auto;border:1px solid #dee2e6;"
+            f"border-top:none;border-radius:0 0 6px 6px;margin-bottom:18px;'>"
+            f"<table style='border-collapse:collapse;width:100%;'>"
+            f"<thead><tr style='background:#f0f2f5;'>{hdr_html}</tr></thead>"
+            f"<tbody>{rows_html}</tbody>"
+            f"</table></div>"
+        )
+        st.markdown(table_html, unsafe_allow_html=True)
+
+    # ── Render: 2 equipos por fila ────────────────────────────────────────────
+    teams_list = MLB_TEAMS[:]
+    for i in range(0, len(teams_list), 2):
+        c1, c2 = st.columns(2)
+        with c1:
+            t = teams_list[i]
+            _render_team_card(t, team_data.get(t, pd.DataFrame()))
+        with c2:
+            if i + 1 < len(teams_list):
+                t = teams_list[i + 1]
+                _render_team_card(t, team_data.get(t, pd.DataFrame()))
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -3618,8 +4029,8 @@ def main():
         st.error("pybaseball no instalado. Ejecuta: pip install pybaseball")
         st.stop()
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["🔥 Bullpen Equipo", "🗺️ Bullpen Liga", "📅 Partidos del Día", "🔮 Pronóstico"]
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["🔥 Bullpen Equipo", "🗺️ Bullpen Liga", "📅 Partidos del Día", "🔮 Pronóstico", "📊 Bullpen Usage"]
     )
 
     with tab1:
@@ -3633,6 +4044,9 @@ def main():
 
     with tab4:
         tab_pronostico()
+
+    with tab5:
+        tab_bullpen_usage()
 
 
 if __name__ == "__main__":
