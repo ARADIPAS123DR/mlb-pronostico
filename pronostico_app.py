@@ -402,6 +402,7 @@ def tab_bullpen_individual():
 
     # ── Stats completas ───────────────────────────────────────────────────────
     st.markdown("#### Stats últimas 2 semanas — todos los relevistas")
+    st.caption("Solo aparecen relevistas con **≥ 2 apariciones** en el período (mín. 2 juegos distintos).")
     stats = _calcular_stats(df_apps)
 
     def _color_fip(val):
@@ -477,6 +478,92 @@ def tab_bullpen_individual():
                 use_container_width=True,
             )
 
+    # ── Tendencia FIP — últimos 45 días ───────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### 📈 Tendencia FIP del Bullpen — últimos 45 días")
+    st.caption("FIP diario calculado con todas las apariciones del bullpen en cada fecha. Línea suavizada = promedio móvil 5 días.")
+
+    with st.spinner("Cargando 45 días para tendencia FIP..."):
+        raw_45d = cargar_statcast_global(dias=45)
+        df_apps_45 = _extraer_apariciones_equipo(raw_45d, team) if not raw_45d.empty else pd.DataFrame()
+
+    if not df_apps_45.empty:
+        # Calcular FIP por día (todas las apariciones de ese día)
+        _daily_fips = []
+        for _gdate, _grp_day in df_apps_45.groupby("game_date"):
+            _ti = _grp_day["IP"].sum()
+            if _ti <= 0:
+                continue
+            _tk = _grp_day["K"].sum()
+            _tb = _grp_day["BB"].sum()
+            _thr = _grp_day["HR"].sum()
+            _fip_day = round(max(0.0, (13*_thr + 3*_tb - 2*_tk) / _ti + FIP_CONST), 2)
+            _daily_fips.append({"Fecha": _gdate, "FIP": _fip_day})
+
+        if len(_daily_fips) >= 2:
+            _df_trend = (pd.DataFrame(_daily_fips)
+                         .sort_values("Fecha")
+                         .reset_index(drop=True))
+            # Promedio móvil 5 días (o menos si hay pocas fechas)
+            _win = min(5, len(_df_trend))
+            _df_trend["FIP_suav"] = (_df_trend["FIP"]
+                                     .rolling(window=_win, min_periods=1)
+                                     .mean()
+                                     .round(2))
+
+            _fig_trend = go.Figure()
+            # Puntos diarios (semitransparentes)
+            _fig_trend.add_trace(go.Scatter(
+                x=_df_trend["Fecha"],
+                y=_df_trend["FIP"],
+                mode="markers",
+                name="FIP diario",
+                marker=dict(color="#1f77b4", size=7, opacity=0.55),
+                hovertemplate="<b>%{x}</b><br>FIP: %{y}<extra></extra>",
+            ))
+            # Línea suavizada
+            _fig_trend.add_trace(go.Scatter(
+                x=_df_trend["Fecha"],
+                y=_df_trend["FIP_suav"],
+                mode="lines",
+                name=f"Prom. móvil {_win}d",
+                line=dict(color="#ff7f0e", width=2.5),
+                hovertemplate="<b>%{x}</b><br>Prom. móvil: %{y}<extra></extra>",
+            ))
+            # Líneas de referencia
+            _x_rng = [_df_trend["Fecha"].min(), _df_trend["Fecha"].max()]
+            _fig_trend.add_shape(type="line", x0=_x_rng[0], x1=_x_rng[1],
+                                 y0=3.50, y1=3.50,
+                                 line=dict(color="#28a745", dash="dash", width=1.5))
+            _fig_trend.add_shape(type="line", x0=_x_rng[0], x1=_x_rng[1],
+                                 y0=4.50, y1=4.50,
+                                 line=dict(color="#dc3545", dash="dash", width=1.5))
+            _fig_trend.add_annotation(x=_x_rng[1], y=3.50, text="Elite (3.50)",
+                                      showarrow=False, xanchor="right",
+                                      font=dict(color="#28a745", size=11))
+            _fig_trend.add_annotation(x=_x_rng[1], y=4.50, text="Malo (4.50)",
+                                      showarrow=False, xanchor="right",
+                                      font=dict(color="#dc3545", size=11))
+            _fig_trend.update_layout(
+                height=360,
+                xaxis=dict(
+                    title="Fecha",
+                    tickformat="%d %b",   # "29 Mar" — sin horas
+                    dtick="86400000",     # un tick por día (ms)
+                    tickangle=-45,
+                ),
+                yaxis=dict(title="FIP", autorange=True),
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                margin=dict(t=20, b=60, l=50, r=20),
+                legend=dict(orientation="h", y=1.08),
+            )
+            st.plotly_chart(_fig_trend, use_container_width=True)
+        else:
+            st.info("Datos insuficientes para graficar tendencia (menos de 2 fechas con actividad).")
+    else:
+        st.info(f"Sin datos Statcast de 45 días para {nombre}.")
+
 
 # =============================================================================
 # TAB 2: BULLPEN LIGA
@@ -485,7 +572,7 @@ def tab_bullpen_individual():
 def tab_bullpen_liga():
     st.markdown("## Liga — Dashboard de Bullpens (30 equipos)")
 
-    col_f1, col_f2, col_f3, col_f4 = st.columns([1, 1, 1, 1])
+    col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns([1, 1, 1, 1, 1])
     with col_f1:
         fecha = st.date_input("Fecha para disponibilidad", value=date.today(), key="liga_fecha")
     with col_f2:
@@ -498,13 +585,18 @@ def tab_bullpen_liga():
                                 key="liga_eq31",
                                 help="Inserta los pitchers disponibles de este equipo como posición 31")
     with col_f4:
+        vista_tabla = st.selectbox("Vista de tabla",
+                                   ["Tabla completa", "Solo disponibles"],
+                                   key="liga_vista",
+                                   help="Tabla completa: stats del bullpen total. Solo disponibles: stats calculadas solo con pitchers disponibles hoy.")
+    with col_f5:
         st.markdown(" ")
         st.button("Actualizar datos", type="primary", key="liga_btn")
 
-    st.caption("Una sola descarga de Statcast cubre los 14 últimos días para todos los equipos. Cache 30 min.")
+    st.caption("Una sola descarga de Statcast cubre los 16 últimos días para todos los equipos. Cache 30 min.")
 
-    with st.spinner("Descargando Statcast (todos los equipos, últimas 2 semanas)..."):
-        raw_global = cargar_statcast_global(dias=14)
+    with st.spinner("Descargando Statcast (todos los equipos, últimos 16 días)..."):
+        raw_global = cargar_statcast_global(dias=16)
 
     if raw_global.empty:
         st.error("No se pudo cargar Statcast. Verifica conexión.")
@@ -659,48 +751,92 @@ def tab_bullpen_liga():
     m4.metric("Disp% promedio liga", f"{int(df_30['Disp%'].mean())}%")
 
     # ── Tabla ─────────────────────────────────────────────────────────────────
-    st.markdown("### Tabla completa")
-
-    def _color_row(row):
-        if row.get("Team") == "EQ31":
-            return ["background-color:#cce5ff;font-weight:bold"] * len(row)
-        try:
-            fip = float(row.get("FIP", 5.0))
-        except:
-            fip = 5.0
-        if row.get("_sin_datos", False):
-            return ["background-color:#f0f0f0;color:#999999"] * len(row)
-        bg = "#d4edda" if fip < 3.50 else ("#fff3cd" if fip < 4.20 else "#f8d7da")
-        return [f"background-color:{bg}"] * len(row)
-
-    cols_show = ["Rank", "Team", "Nombre", "Relev.", "IP", "K%", "BB%", "FIP",
-                 "WHIP", "wOBA", "ER/9", "Disp", "Limit", "NDisp", "Disp%"]
-    _rc2 = {c: 2 for c in ["IP","K%","BB%","FIP","WHIP","wOBA","ER/9"] if c in df_liga.columns}
-    df_show = (df_liga[[c for c in cols_show if c in df_liga.columns]]
-               .set_index("Rank")
-               .round(_rc2))
     _fmt2 = st.column_config.NumberColumn(format="%.2f")
     _fmt1 = st.column_config.NumberColumn(format="%.1f")
     _fmt0 = st.column_config.NumberColumn(format="%d")
-    st.dataframe(
-        df_show.style.apply(_color_row, axis=1),
-        use_container_width=True, height=950,
-        column_config={
-            "Team":  None,
-            "IP":    _fmt1,
-            "K%":    _fmt1,
-            "BB%":   _fmt1,
-            "FIP":   _fmt2,
-            "WHIP":  _fmt2,
-            "wOBA":  _fmt2,
-            "ER/9":  _fmt2,
-            "Disp":  _fmt0,
-            "Limit": _fmt0,
-            "NDisp": _fmt0,
-            "Disp%": _fmt0,
-        },
-    )
-    st.caption("★=Equipo 31 | 🟢 FIP<3.50 | 🟡 3.50-4.20 | 🔴 >4.20")
+
+    if vista_tabla == "Solo disponibles":
+        st.markdown("### Tabla — Solo pitchers disponibles")
+
+        def _color_row_disp(row):
+            if row.get("Team") == "EQ31":
+                return ["background-color:#cce5ff;font-weight:bold"] * len(row)
+            try:
+                fip = float(row.get("FIP_disp", 5.0))
+            except:
+                fip = 5.0
+            if row.get("_sin_datos", False):
+                return ["background-color:#f0f0f0;color:#999999"] * len(row)
+            bg = "#d4edda" if fip < 3.50 else ("#fff3cd" if fip < 4.20 else "#f8d7da")
+            return [f"background-color:{bg}"] * len(row)
+
+        cols_disp = ["Rank", "Team", "Nombre", "Relev.", "Disp", "Limit", "NDisp", "Disp%",
+                     "FIP_disp", "K%_disp", "BB%_disp", "wOBA_disp"]
+        _rc_disp = {c: 2 for c in ["FIP_disp","K%_disp","BB%_disp","wOBA_disp"] if c in df_liga.columns}
+        df_show_disp = (df_liga[[c for c in cols_disp if c in df_liga.columns]]
+                        .rename(columns={
+                            "FIP_disp": "FIP (disp)", "K%_disp": "K% (disp)",
+                            "BB%_disp": "BB% (disp)", "wOBA_disp": "wOBA (disp)",
+                        })
+                        .set_index("Rank")
+                        .round({c: 2 for c in ["FIP (disp)","K% (disp)","BB% (disp)","wOBA (disp)"]}))
+        st.dataframe(
+            df_show_disp.style.apply(_color_row_disp, axis=1),
+            use_container_width=True, height=950,
+            column_config={
+                "Team":        None,
+                "FIP (disp)":  _fmt2,
+                "K% (disp)":   _fmt1,
+                "BB% (disp)":  _fmt1,
+                "wOBA (disp)": _fmt2,
+                "Disp":  _fmt0,
+                "Limit": _fmt0,
+                "NDisp": _fmt0,
+                "Disp%": _fmt0,
+            },
+        )
+        st.caption("★=Equipo 31 | Stats calculadas con pitchers disponibles hoy | 🟢 FIP<3.50 | 🟡 3.50-4.20 | 🔴 >4.20")
+
+    else:
+        st.markdown("### Tabla completa")
+
+        def _color_row(row):
+            if row.get("Team") == "EQ31":
+                return ["background-color:#cce5ff;font-weight:bold"] * len(row)
+            try:
+                fip = float(row.get("FIP", 5.0))
+            except:
+                fip = 5.0
+            if row.get("_sin_datos", False):
+                return ["background-color:#f0f0f0;color:#999999"] * len(row)
+            bg = "#d4edda" if fip < 3.50 else ("#fff3cd" if fip < 4.20 else "#f8d7da")
+            return [f"background-color:{bg}"] * len(row)
+
+        cols_show = ["Rank", "Team", "Nombre", "Relev.", "IP", "K%", "BB%", "FIP",
+                     "WHIP", "wOBA", "ER/9", "Disp", "Limit", "NDisp", "Disp%"]
+        _rc2_main = {c: 2 for c in ["IP","K%","BB%","FIP","WHIP","wOBA","ER/9"] if c in df_liga.columns}
+        df_show = (df_liga[[c for c in cols_show if c in df_liga.columns]]
+                   .set_index("Rank")
+                   .round(_rc2_main))
+        st.dataframe(
+            df_show.style.apply(_color_row, axis=1),
+            use_container_width=True, height=950,
+            column_config={
+                "Team":  None,
+                "IP":    _fmt1,
+                "K%":    _fmt1,
+                "BB%":   _fmt1,
+                "FIP":   _fmt2,
+                "WHIP":  _fmt2,
+                "wOBA":  _fmt2,
+                "ER/9":  _fmt2,
+                "Disp":  _fmt0,
+                "Limit": _fmt0,
+                "NDisp": _fmt0,
+                "Disp%": _fmt0,
+            },
+        )
+        st.caption("★=Equipo 31 | 🟢 FIP<3.50 | 🟡 3.50-4.20 | 🔴 >4.20")
 
     # ── Ranking disponibles ───────────────────────────────────────────────────
     st.markdown(f"#### Ranking — Mejores bullpens disponibles el {fecha.strftime('%d %b %Y')}")
@@ -962,6 +1098,134 @@ def cargar_h2h(team_id_home: int, team_id_away: int, season: int = None) -> str:
     except Exception:
         pass
     return "—"
+
+
+# ── Standings de la liga (clasificación actual) ───────────────────────────────
+
+@st.cache_data(ttl=14400, show_spinner=False)
+def cargar_standings_liga(season: int = None) -> dict:
+    """Retorna {team_id: {'wins': int, 'losses': int, 'pct': float}} para todos los equipos."""
+    if season is None:
+        season = date.today().year
+    try:
+        url = (
+            "https://statsapi.mlb.com/api/v1/standings"
+            f"?leagueId=103,104&season={season}&standingsTypes=regularSeason"
+        )
+        r = _req_http.get(url, timeout=12)
+        r.raise_for_status()
+        result = {}
+        for rec in r.json().get("records", []):
+            for tr in rec.get("teamRecords", []):
+                tid = tr["team"].get("id")
+                w = int(tr.get("wins", 0))
+                l = int(tr.get("losses", 0))
+                pct = round(w / (w + l), 3) if (w + l) > 0 else 0.0
+                if tid:
+                    result[tid] = {"wins": w, "losses": l, "pct": pct}
+        return result
+    except Exception:
+        return {}
+
+
+# ── SOS (Strength of Schedule) ────────────────────────────────────────────────
+
+@st.cache_data(ttl=14400, show_spinner=False)
+def cargar_sos_equipo(team_id: int, season: int = None) -> dict:
+    """
+    Retorna:
+      sos_30d:    float | None  — win% promedio de oponentes en los últimos 30 días.
+      sos_7d:     float | None  — win% promedio de oponentes en los próximos 7 días.
+      sos_14d:    float | None  — win% promedio de oponentes en los próximos 14 días.
+      rec_vs_500: str           — W-L del equipo vs rivales con win% ≥ 0.500 (últimos 46d).
+      g_30d:      int           — partidos jugados en los últimos 30d.
+      g_7d:       int           — partidos programados en los próximos 7d.
+      g_14d:      int           — partidos programados en los próximos 14d.
+    """
+    if season is None:
+        season = date.today().year
+    today        = date.today()
+    start_past   = today - timedelta(days=46)   # cubre SOS-30d Y récord vs .500 (46d)
+    end_future   = today + timedelta(days=14)
+    cutoff_30d   = today - timedelta(days=30)
+    cutoff_7d_f  = today + timedelta(days=7)
+    _empty = {
+        "sos_30d": None, "sos_7d": None, "sos_14d": None,
+        "rec_vs_500": "—", "g_30d": 0, "g_7d": 0, "g_14d": 0,
+    }
+    if not team_id:
+        return _empty
+    try:
+        url = (
+            "https://statsapi.mlb.com/api/v1/schedule"
+            f"?sportId=1&teamId={team_id}&season={season}&gameType=R"
+            f"&startDate={start_past.strftime('%Y-%m-%d')}&endDate={end_future.strftime('%Y-%m-%d')}"
+            "&hydrate=team,linescore"
+        )
+        r = _req_http.get(url, timeout=15)
+        r.raise_for_status()
+        standings = cargar_standings_liga(season)
+
+        past_games  = []   # {'opp_id': int, 'won': bool, 'gdate': date}
+        future_opps = []   # {'opp_id': int, 'gdate': date}
+
+        for db in r.json().get("dates", []):
+            try:
+                gdate = date.fromisoformat(db.get("date", ""))
+            except Exception:
+                continue
+            for g in db.get("games", []):
+                status  = g.get("status", {}).get("abstractGameState", "")
+                h_id    = g["teams"]["home"]["team"].get("id")
+                a_id    = g["teams"]["away"]["team"].get("id")
+                is_home = (h_id == team_id)
+                opp_id  = a_id if is_home else h_id
+
+                if status == "Final" and gdate >= start_past:
+                    h_s = g["teams"]["home"].get("score", 0) or 0
+                    a_s = g["teams"]["away"].get("score", 0) or 0
+                    won = (h_s > a_s) if is_home else (a_s > h_s)
+                    past_games.append({"opp_id": opp_id, "won": won, "gdate": gdate})
+                elif status not in ("Final", "In Progress") and gdate > today:
+                    future_opps.append({"opp_id": opp_id, "gdate": gdate})
+
+        # SOS últimos 30 días
+        pcts_30 = [standings.get(g["opp_id"], {}).get("pct")
+                   for g in past_games if g["gdate"] >= cutoff_30d
+                   and standings.get(g["opp_id"], {}).get("pct") is not None]
+
+        # Récord vs .500 — últimos 46 días (todos los past_games)
+        w500 = l500 = 0
+        for g in past_games:
+            p = standings.get(g["opp_id"], {}).get("pct")
+            if p is not None and p >= 0.500:
+                if g["won"]: w500 += 1
+                else:        l500 += 1
+
+        # SOS próximos 7 días
+        pcts_7 = [standings.get(g["opp_id"], {}).get("pct")
+                  for g in future_opps if g["gdate"] <= cutoff_7d_f
+                  and standings.get(g["opp_id"], {}).get("pct") is not None]
+
+        # SOS próximos 14 días
+        pcts_14 = [standings.get(g["opp_id"], {}).get("pct")
+                   for g in future_opps
+                   if standings.get(g["opp_id"], {}).get("pct") is not None]
+
+        g_30d = sum(1 for g in past_games if g["gdate"] >= cutoff_30d)
+        g_7d  = sum(1 for g in future_opps if g["gdate"] <= cutoff_7d_f)
+
+        return {
+            "sos_30d":    round(sum(pcts_30) / len(pcts_30), 3) if pcts_30 else None,
+            "sos_7d":     round(sum(pcts_7)  / len(pcts_7),  3) if pcts_7  else None,
+            "sos_14d":    round(sum(pcts_14) / len(pcts_14), 3) if pcts_14 else None,
+            "rec_vs_500": f"{w500}-{l500}" if (w500 + l500) > 0 else "—",
+            "g_30d":      g_30d,
+            "g_7d":       g_7d,
+            "g_14d":      len(future_opps),
+        }
+    except Exception:
+        return _empty
 
 
 # ── Récord vs mano del pitcher ────────────────────────────────────────────────
@@ -1505,7 +1769,8 @@ def _batting_risp_from_statcast(raw: pd.DataFrame, min_pa: int = 10) -> dict:
 @st.cache_data(ttl=3600, show_spinner=False)
 def cargar_hot_hitters(team_id: int, dias: int = 14) -> list:
     """Top 5 bateadores por wOBA calculado para el equipo en los últimos `dias` días.
-    Fallback a las últimas 2 semanas de la temporada anterior si no hay datos."""
+    Agrega todas las entradas por jugador (el API puede devolver una por juego).
+    Mín. 2 PA totales para aparecer (permite inicio de temporada)."""
     if not team_id:
         return []
     today    = date.today()
@@ -1517,7 +1782,7 @@ def cargar_hot_hitters(team_id: int, dias: int = 14) -> list:
                 "https://statsapi.mlb.com/api/v1/stats"
                 f"?stats=byDateRange&group=hitting"
                 f"&startDate={s_date}&endDate={e_date}"
-                f"&sportId=1&gameType=R&teamId={team_id}&limit=150"
+                f"&sportId=1&gameType=R&teamId={team_id}&limit=500"
             )
             r = _req_http.get(url, timeout=15)
             r.raise_for_status()
@@ -1527,31 +1792,50 @@ def cargar_hot_hitters(team_id: int, dias: int = 14) -> list:
 
     splits = _fetch_splits(start_dt, today)
 
-    rows = []
+    # Agregar por jugador (el API puede devolver una entrada por juego)
+    from collections import defaultdict
+    player_totals: dict = defaultdict(lambda: {
+        "name": "—", "pa": 0, "ab": 0, "bb": 0, "hbp": 0,
+        "hits": 0, "d2": 0, "d3": 0, "hr": 0, "sf": 0, "ops_sum": 0.0, "ops_n": 0,
+    })
     for sp in splits:
-        s  = sp.get("stat", {})
-        pa = int(s.get("plateAppearances", 0))
-        if pa < 5:
+        pid  = sp.get("player", {}).get("id", 0)
+        name = sp.get("player", {}).get("fullName", "—")
+        s    = sp.get("stat", {})
+        t    = player_totals[pid]
+        t["name"]    = name
+        t["pa"]     += int(s.get("plateAppearances", 0))
+        t["ab"]     += int(s.get("atBats", 0))
+        t["bb"]     += int(s.get("baseOnBalls", 0))
+        t["hbp"]    += int(s.get("hitByPitch", 0))
+        t["hits"]   += int(s.get("hits", 0))
+        t["d2"]     += int(s.get("doubles", 0))
+        t["d3"]     += int(s.get("triples", 0))
+        t["hr"]     += int(s.get("homeRuns", 0))
+        t["sf"]     += int(s.get("sacFlies", 0))
+        _ops = float(s.get("ops", 0) or 0)
+        if _ops > 0:
+            t["ops_sum"] += _ops
+            t["ops_n"]   += 1
+
+    rows = []
+    for pid, t in player_totals.items():
+        pa = t["pa"]
+        if pa < 2:          # mín. 2 PA totales (inicio de temporada)
             continue
-        ab      = int(s.get("atBats", 0))
-        bb      = int(s.get("baseOnBalls", 0))
-        hbp     = int(s.get("hitByPitch", 0))
-        hits    = int(s.get("hits", 0))
-        d2      = int(s.get("doubles", 0))
-        d3      = int(s.get("triples", 0))
-        hr      = int(s.get("homeRuns", 0))
-        sf      = int(s.get("sacFlies", 0))
+        ab      = t["ab"]; bb = t["bb"]; hbp = t["hbp"]
+        hits    = t["hits"]; d2 = t["d2"]; d3 = t["d3"]; hr = t["hr"]; sf = t["sf"]
         singles = max(0, hits - d2 - d3 - hr)
         denom   = ab + bb + hbp + sf
         woba    = round(
             (0.69*bb + 0.72*hbp + 0.89*singles + 1.27*d2 + 1.62*d3 + 2.10*hr) / denom, 3
         ) if denom > 0 else 0.0
-        ops     = float(s.get("ops", 0) or 0)
+        ops = round(t["ops_sum"] / t["ops_n"], 3) if t["ops_n"] > 0 else 0.0
         rows.append({
-            "Bateador": sp.get("player", {}).get("fullName", "—"),
-            "PA":  pa,
+            "Bateador": t["name"],
+            "PA":   pa,
             "wOBA": woba,
-            "OPS":  round(ops, 3),
+            "OPS":  ops,
             "HR":   hr,
         })
 
@@ -1927,21 +2211,25 @@ def tab_partidos_dia():  # noqa: C901
     today = date.today()
     if not raw_30d.empty and "game_date" in raw_30d.columns:
         _cutoff14 = today - timedelta(days=14)
+        _cutoff16 = today - timedelta(days=16)
+        _cutoff17 = today - timedelta(days=17)
         raw_14d   = raw_30d[raw_30d["game_date"] >= _cutoff14].copy()
+        raw_16d   = raw_30d[raw_30d["game_date"] >= _cutoff16].copy()
+        raw_17d   = raw_30d[raw_30d["game_date"] >= _cutoff17].copy()
     else:
-        raw_14d = pd.DataFrame()
+        raw_14d = raw_16d = raw_17d = pd.DataFrame()
 
     # Batting by split
     batting_vs_R_14  = _batting_from_statcast(raw_14d,  p_throws="R")
     batting_vs_R_30  = _batting_from_statcast(raw_30d,  p_throws="R")
     batting_vs_L_30  = _batting_from_statcast(raw_30d,  p_throws="L")
-    batting_vs_bp_14 = _batting_from_statcast(raw_14d,  min_inning=6)
+    batting_vs_bp_16 = _batting_from_statcast(raw_16d,  min_inning=6)
     batting_vs_bp_30 = _batting_from_statcast(raw_30d,  min_inning=6)
 
-    # ── RISP últimos 14 días — todos los equipos ──────────────────────────────
-    batting_risp_14  = _batting_risp_from_statcast(raw_14d, min_pa=10)
+    # ── RISP últimos 17 días — todos los equipos ──────────────────────────────
+    batting_risp_17  = _batting_risp_from_statcast(raw_17d, min_pa=10)
     # Ranking liga completa por wOBA con RISP (mayor = mejor)
-    _risp_sorted     = sorted(batting_risp_14.items(), key=lambda x: x[1]["wOBA"], reverse=True)
+    _risp_sorted     = sorted(batting_risp_17.items(), key=lambda x: x[1]["wOBA"], reverse=True)
     risp_rank_liga: dict = {t: i + 1 for i, (t, _) in enumerate(_risp_sorted)}
     n_risp_liga = len(_risp_sorted)
 
@@ -1977,8 +2265,8 @@ def tab_partidos_dia():  # noqa: C901
         if _ab:
             slate_bat_vs_starter[a] = {**_ab, "hand": h_hand,
                                         "period": "ult.14d" if h_hand == "R" else "ult.30d"}
-        if batting_vs_bp_14.get(h): slate_bat_vs_bull[h] = batting_vs_bp_14[h]
-        if batting_vs_bp_14.get(a): slate_bat_vs_bull[a] = batting_vs_bp_14[a]
+        if batting_vs_bp_16.get(h): slate_bat_vs_bull[h] = batting_vs_bp_16[h]
+        if batting_vs_bp_16.get(a): slate_bat_vs_bull[a] = batting_vs_bp_16[a]
 
     _sbs = sorted(slate_bat_vs_starter.items(), key=lambda x: x[1].get("wOBA", 0), reverse=True)
     slate_bat_rank:  dict = {t: i + 1 for i, (t, _) in enumerate(_sbs)}
@@ -2085,8 +2373,18 @@ def tab_partidos_dia():  # noqa: C901
     st.markdown(f"### {fecha_sel.strftime('%A %d %b %Y')} — {len(partidos)} partidos")
     st.caption(
         "Iniciadores: ults. salidas disponibles | Bateo: Statcast 14d vs RHP, 30d vs LHP | "
-        "Bullpen: disp. Statcast 14d, mín. 2 aps."
+        "Bullpen: disp. Statcast 14d, mín. 2 aps. | Bateo vs BP: ult. 16d | RISP: ult. 17d"
     )
+
+    # ── Precargar SOS de todos los equipos del slate ─────────────────────────
+    with st.spinner("Cargando Strength of Schedule..."):
+        _sos_tids: set = set()
+        for _pp in partidos:
+            for _tk in ("home_abbr", "away_abbr"):
+                _tid_tmp = MLB_TEAM_IDS.get(_pp[_tk])
+                if _tid_tmp:
+                    _sos_tids.add(_tid_tmp)
+        _sos_map: dict = {_t: cargar_sos_equipo(_t) for _t in _sos_tids}
 
     # ═══════════════════════════════════════════════════════════════════════════
     # EXPANDER POR PARTIDO
@@ -2115,8 +2413,8 @@ def tab_partidos_dia():  # noqa: C901
         _a_bat = batting_vs_R_14.get(a, {}) if h_hand == "R" else batting_vs_L_30.get(a, {})
         _h_per = "ult.14d" if a_hand == "R" else "ult.30d"
         _a_per = "ult.14d" if h_hand == "R" else "ult.30d"
-        _h_bp  = batting_vs_bp_14.get(h, {})
-        _a_bp  = batting_vs_bp_14.get(a, {})
+        _h_bp  = batting_vs_bp_16.get(h, {})
+        _a_bp  = batting_vs_bp_16.get(a, {})
 
         # Récords de los equipos
         _h_tid = MLB_TEAM_IDS.get(h); _a_tid = MLB_TEAM_IDS.get(a)
@@ -2126,6 +2424,9 @@ def tab_partidos_dia():  # noqa: C901
         # Record vs mano del pitcher que enfrentan hoy
         _rvh_h = cargar_record_vs_hand(_h_tid, a_hand) if _h_tid else "—"  # home vs away pitcher hand
         _rvh_a = cargar_record_vs_hand(_a_tid, h_hand) if _a_tid else "—"  # away vs home pitcher hand
+        # SOS
+        _sos_h = _sos_map.get(_h_tid, {})
+        _sos_a = _sos_map.get(_a_tid, {})
         # Día de la semana del partido
         _wday  = fecha_sel.weekday()
         _wday_names = {0:"Lun",1:"Mar",2:"Mié",3:"Jue",4:"Vie",5:"Sáb",6:"Dom"}
@@ -2138,7 +2439,7 @@ def tab_partidos_dia():  # noqa: C901
 
         with st.expander(
             f"**{a_name}** @ **{h_name}**  —  {p['hora']}  |  {p['venue']}",
-            expanded=True,
+            expanded=False,
         ):
             # ── Clima ────────────────────────────────────────────────────────
             if _clima:
@@ -2154,24 +2455,43 @@ def tab_partidos_dia():  # noqa: C901
                 st.caption("🏟️ Estadio techado — sin efecto de viento")
 
             # ── Récords de equipo ────────────────────────────────────────────
-            st.markdown("#### 📋 Récords")
+            st.markdown("#### 📋 Récords & SOS")
             _cr1, _cr2 = st.columns(2)
-            for _col, _tname, _rec, _rvh, _hand_lbl, _wdrec in [
-                (_cr1, a_name, _rec_a, _rvh_a, "RHP" if h_hand == "R" else "LHP", _wd_rec_a),
-                (_cr2, h_name, _rec_h, _rvh_h, "RHP" if a_hand == "R" else "LHP", _wd_rec_h),
+            for _col, _tname, _rec, _rvh, _hand_lbl, _wdrec, _sos in [
+                (_cr1, a_name, _rec_a, _rvh_a, "RHP" if h_hand == "R" else "LHP", _wd_rec_a, _sos_a),
+                (_cr2, h_name, _rec_h, _rvh_h, "RHP" if a_hand == "R" else "LHP", _wd_rec_h, _sos_h),
             ]:
                 with _col:
                     _s   = _rec.get("season", "—")
                     _l10 = _rec.get("last10", "—")
                     _h10 = _rec.get("home10", "—")
                     _a10 = _rec.get("away10", "—")
+                    # SOS labels
+                    _s30v = _sos.get("sos_30d")
+                    _s7v  = _sos.get("sos_7d")
+                    _s14v = _sos.get("sos_14d")
+                    _g30  = _sos.get("g_30d", 0)
+                    _g7   = _sos.get("g_7d",  0)
+                    _g14  = _sos.get("g_14d", 0)
+                    _rv5  = _sos.get("rec_vs_500", "—")
+                    def _sos_label(v):
+                        if v is None: return "—"
+                        s = f"{v:.3f}"
+                        if v >= 0.520:   return f"{s} 🔴"
+                        elif v >= 0.500: return f"{s} 🟡"
+                        else:            return f"{s} 🟢"
                     st.markdown(
                         f"**{_tname}**  \n"
                         f"Temporada: `{_s}` | Últ.10: `{_l10}`  \n"
                         f"Casa(10): `{_h10}` | Visita(10): `{_a10}`  \n"
-                        f"Vs {_hand_lbl}: `{_rvh}` | {_wday_lbl}: `{_wdrec}`"
+                        f"Vs {_hand_lbl}: `{_rvh}` | {_wday_lbl}: `{_wdrec}`  \n"
+                        f"SOS-30d ({_g30}G): **{_sos_label(_s30v)}** | "
+                        f"Vs .500+ (46d): `{_rv5}`  \n"
+                        f"SOS fut-7d ({_g7}G): **{_sos_label(_s7v)}** | "
+                        f"SOS fut-14d ({_g14}G): **{_sos_label(_s14v)}**"
                     )
-            st.caption(f"H2H temporada ({a_name} vs {h_name}): **{_h2h}** (récord del local)")
+            st.caption(f"H2H temporada ({a_name} vs {h_name}): **{_h2h}** (récord del local) | "
+                       f"SOS: 🟢 <.500 fácil | 🟡 .500-.519 | 🔴 ≥.520 difícil")
 
             st.divider()
 
@@ -2196,7 +2516,7 @@ def tab_partidos_dia():  # noqa: C901
             st.divider()
 
             # ── Bateo vs Bullpen (inn 6+) ────────────────────────────────────
-            st.markdown("#### 🛡️ Bateo vs Bullpen (inn. 6+, ult. 14d)")
+            st.markdown("#### 🛡️ Bateo vs Bullpen (inn. 6+, ult. 16d)")
             _cbp1, _cbp2 = st.columns(2)
             for _col, _team, _tname, _bpd in [
                 (_cbp1, a, a_name, _a_bp), (_cbp2, h, h_name, _h_bp)
@@ -2268,11 +2588,11 @@ def tab_partidos_dia():  # noqa: C901
             st.divider()
 
             # ── Fuego en el bat: RISP ────────────────────────────────────────
-            st.markdown("#### 🔥 Fuego en el Bat — Bateo con RISP (ult. 14d)")
+            st.markdown("#### 🔥 Fuego en el Bat — Bateo con RISP (ult. 17d)")
             _cr1, _cr2 = st.columns(2)
             for _col, _team, _tname in [(_cr1, a, a_name), (_cr2, h, h_name)]:
                 with _col:
-                    _rd = batting_risp_14.get(_team, {})
+                    _rd = batting_risp_17.get(_team, {})
                     _rk = risp_rank_liga.get(_team)
                     st.markdown(f"**{_tname}**")
                     if _rd:
@@ -2333,7 +2653,7 @@ def tab_partidos_dia():  # noqa: C901
     # ── Ranking slate: bateo vs bullpen ───────────────────────────────────────
     if _sbull:
         st.divider()
-        st.markdown("### 🛡️ Ranking Slate — Bateo vs Bullpen (inn. 6+, ult. 14d)")
+        st.markdown("### 🛡️ Ranking Slate — Bateo vs Bullpen (inn. 6+, ult. 16d)")
         _rows_bul = [
             {"#": _i + 1, "Equipo": TEAM_NAMES.get(_t, _t),
              "wOBA": _d["wOBA"], "wRC+": _d["wRC+"], "PA": _d["PA"]}
@@ -3034,15 +3354,19 @@ def tab_pronostico():
     today_p = date.today()
     if not raw_30_p.empty and "game_date" in raw_30_p.columns:
         _c14 = today_p - timedelta(days=14)
+        _c16 = today_p - timedelta(days=16)
+        _c17 = today_p - timedelta(days=17)
         raw_14_p = raw_30_p[raw_30_p["game_date"] >= _c14].copy()
+        raw_16_p = raw_30_p[raw_30_p["game_date"] >= _c16].copy()
+        raw_17_p = raw_30_p[raw_30_p["game_date"] >= _c17].copy()
     else:
-        raw_14_p = pd.DataFrame()
+        raw_14_p = raw_16_p = raw_17_p = pd.DataFrame()
 
     bat_vs_R_14_p  = _batting_from_statcast(raw_14_p, p_throws="R")
     bat_vs_L_30_p  = _batting_from_statcast(raw_30_p, p_throws="L")
-    bat_vs_bp_14_p = _batting_from_statcast(raw_14_p, min_inning=6)
-    bat_risp_14_p  = _batting_risp_from_statcast(raw_14_p, min_pa=10)
-    _risp_srt_p    = sorted(bat_risp_14_p.items(), key=lambda x: x[1]["wOBA"], reverse=True)
+    bat_vs_bp_16_p = _batting_from_statcast(raw_16_p, min_inning=6)
+    bat_risp_17_p  = _batting_risp_from_statcast(raw_17_p, min_pa=10)
+    _risp_srt_p    = sorted(bat_risp_17_p.items(), key=lambda x: x[1]["wOBA"], reverse=True)
     risp_rank_p    = {t: i + 1 for i, (t, _) in enumerate(_risp_srt_p)}
 
     # ── Statcast bullpen ─────────────────────────────────────────────────────
@@ -3118,7 +3442,7 @@ def tab_pronostico():
             raw_global     = raw_bull_p,
             batting_vs_R_14= bat_vs_R_14_p,
             batting_vs_L_30= bat_vs_L_30_p,
-            batting_vs_bp_14= bat_vs_bp_14_p,
+            batting_vs_bp_14= bat_vs_bp_16_p,
             rank_global    = rank_gl_p,
             rank_dia_lookup= rank_dia_p,
             n_rank_dia     = n_rank_p,
@@ -3126,7 +3450,7 @@ def tab_pronostico():
             records        = records_cache,
             h2h            = h2h_str,
             clima          = clima_p,
-            batting_risp   = bat_risp_14_p,
+            batting_risp   = bat_risp_17_p,
             risp_rank      = risp_rank_p,
             pitcher_rec    = pitcher_rec_cache,
         )
