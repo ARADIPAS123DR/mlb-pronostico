@@ -483,7 +483,7 @@ def tab_bullpen_individual():
             stats[["Pitcher","G","IP","PA","K%","BB%","FIP","ERA","WHIP","wOBA","ER"]]
             .set_index("Pitcher")
             .round({c: 2 for c in _num_cols})
-            .style.applymap(_color_fip, subset=["FIP"]),
+            .style.map(_color_fip, subset=["FIP"]),
             use_container_width=True,
         )
 
