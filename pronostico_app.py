@@ -5,6 +5,9 @@
 
 import warnings
 warnings.filterwarnings("ignore")
+import sys
+import traceback
+sys.setrecursionlimit(3000)
 
 import streamlit as st
 import pandas as pd
@@ -2214,7 +2217,7 @@ def cargar_partidos_mlb(fecha: date) -> list:
                 })
         return games
     except Exception as e:
-        st.warning(f"Error cargando partidos: {e}")
+        st.error(f"Error cargando partidos: {e}\n\n```\n{traceback.format_exc()[-2000:]}\n```")
         return []
 
 
