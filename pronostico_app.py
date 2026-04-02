@@ -200,7 +200,8 @@ def cargar_statcast_global(dias: int = 14) -> pd.DataFrame:
         if raw.empty:
             return pd.DataFrame()
         return raw
-    except Exception:
+    except Exception as e:
+        st.warning(f"Statcast error: {e}")
         return pd.DataFrame()
 
 
