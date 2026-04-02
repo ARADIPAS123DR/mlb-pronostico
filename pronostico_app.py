@@ -2233,7 +2233,8 @@ def cargar_partidos_mlb(fecha: date) -> list:
                     "game_pk": g.get("gamePk"),
                 })
         return games
-    except Exception:
+    except Exception as e:
+        st.warning(f"Error cargando partidos: {e}")
         return []
 
 
