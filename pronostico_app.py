@@ -28,24 +28,26 @@ try:
         pybaseball.cache.enable()
     except Exception:
         pass
-    # Parchear headers para evitar 403
+    # Parchear headers para evitar 403 (solo una vez)
     try:
         import requests as _requests
         import pybaseball.datasources.html_table_processor as _htp
-        _BROWSER_HEADERS = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
-        _orig_get = _requests.get
-        def _patched_get(url, **kwargs):
-            headers = kwargs.pop("headers", {})
-            headers = {**_BROWSER_HEADERS, **headers}
-            return _orig_get(url, headers=headers, **kwargs)
-        _htp.requests.get = _patched_get
+        if not getattr(_htp.requests.get, "_mlb_patched", False):
+            _BROWSER_HEADERS = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+            _orig_get = _requests.get
+            def _patched_get(url, **kwargs):
+                headers = kwargs.pop("headers", {})
+                headers = {**_BROWSER_HEADERS, **headers}
+                return _orig_get(url, headers=headers, **kwargs)
+            _patched_get._mlb_patched = True
+            _htp.requests.get = _patched_get
     except Exception:
         pass
     HAS_PYBASEBALL = True
