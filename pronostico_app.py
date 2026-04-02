@@ -190,9 +190,25 @@ def cargar_statcast_global(dias: int = 14) -> pd.DataFrame:
     try:
         end_dt   = date.today()
         start_dt = end_dt - timedelta(days=dias)
-        raw = statcast(start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
-        if raw is None or raw.empty:
+        # Descarga en bloques de 7 días para evitar recursión infinita de pybaseball
+        CHUNK = 7
+        chunks = []
+        chunk_start = start_dt
+        while chunk_start <= end_dt:
+            chunk_end = min(chunk_start + timedelta(days=CHUNK - 1), end_dt)
+            try:
+                part = statcast(
+                    chunk_start.strftime("%Y-%m-%d"),
+                    chunk_end.strftime("%Y-%m-%d"),
+                )
+                if part is not None and not part.empty:
+                    chunks.append(part)
+            except Exception:
+                pass
+            chunk_start = chunk_end + timedelta(days=1)
+        if not chunks:
             return pd.DataFrame()
+        raw = pd.concat(chunks, ignore_index=True)
         raw["game_date"] = pd.to_datetime(raw["game_date"]).dt.date
         # Solo temporada regular (excluye pretemporada S, postemporada D/L/W/F)
         if "game_type" in raw.columns:
