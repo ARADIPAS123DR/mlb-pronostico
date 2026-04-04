@@ -2952,6 +2952,8 @@ def calcular_ventaja_partido(partido: dict, resumenes: dict, raw_global,
 
     pts_home = 0.0
     pts_away = 0.0
+    pts_home_f5 = 0.0   # sub-score solo con factores del starter (para F5)
+    pts_away_f5 = 0.0
     factores = []
 
     # ── Factor 1: FIP iniciador (3 pts para el equipo que ENFRENTA al peor pitcher) ──
@@ -2972,10 +2974,10 @@ def calcular_ventaja_partido(partido: dict, resumenes: dict, raw_global,
         else:
             pts = 0.5
         if fip_h > fip_a:  # starter local es PEOR → visitante gana puntos
-            pts_away += pts
+            pts_away += pts; pts_away_f5 += pts
             factores.append(f"✅ Visitante: FIP iniciadores ({fip_h:.2f} vs {fip_a:.2f}, dif {diff:.2f}) +{pts}pt")
         else:
-            pts_home += pts
+            pts_home += pts; pts_home_f5 += pts
             factores.append(f"✅ Local: FIP iniciadores ({fip_h:.2f} vs {fip_a:.2f}, dif {diff:.2f}) +{pts}pt")
     else:
         factores.append("❓ FIP iniciadores: sin datos")
@@ -2986,10 +2988,10 @@ def calcular_ventaja_partido(partido: dict, resumenes: dict, raw_global,
     # ERA_FIP = ERA - FIP; si positivo, pitcher tiene suerte negativa → esperamos regresión (mejor)
     # Si ERA_FIP > 0.5 → el equipo visitante (batting) se beneficia del starter local que regresará
     if ef_h is not None and ef_h > 0.5:
-        pts_away += 0.5
+        pts_away += 0.5; pts_away_f5 += 0.5
         factores.append(f"✅ Visitante: starter local ERA-FIP={ef_h:.2f} (regresión esperada) +0.5pt")
     elif ef_a is not None and ef_a > 0.5:
-        pts_home += 0.5
+        pts_home += 0.5; pts_home_f5 += 0.5
         factores.append(f"✅ Local: starter visitante ERA-FIP={ef_a:.2f} (regresión esperada) +0.5pt")
     else:
         factores.append("🟰 ERA-FIP: sin señal clara de regresión")
@@ -3024,13 +3026,13 @@ def calcular_ventaja_partido(partido: dict, resumenes: dict, raw_global,
     _rust_pen_a, _rust_desc_a = _rust_penalty(_last_a, _game_dt_rust)
 
     if _rust_pen_h > 0:
-        pts_away += _rust_pen_h
+        pts_away += _rust_pen_h; pts_away_f5 += _rust_pen_h
         factores.append(f"🦾 Visitante: starter local con óxido — {_rust_desc_h} +{_rust_pen_h}pt")
     elif _rust_desc_h != "sin datos de fecha":
         factores.append(f"✅ Starter local: {_rust_desc_h}")
 
     if _rust_pen_a > 0:
-        pts_home += _rust_pen_a
+        pts_home += _rust_pen_a; pts_home_f5 += _rust_pen_a
         factores.append(f"🦾 Local: starter visitante con óxido — {_rust_desc_a} +{_rust_pen_a}pt")
     elif _rust_desc_a != "sin datos de fecha":
         factores.append(f"✅ Starter visitante: {_rust_desc_a}")
@@ -3055,13 +3057,13 @@ def calcular_ventaja_partido(partido: dict, resumenes: dict, raw_global,
     _p4a = _wrc_pts(wrc_away_vs)
     _p4h = _wrc_pts(wrc_home_vs)
     if _p4a is not None:
-        pts_away += _p4a
+        pts_away += _p4a; pts_away_f5 += _p4a
         _ic = "✅" if _p4a > 0 else ("🔴" if _p4a < 0 else "🟰")
         factores.append(f"{_ic} Visitante: wRC+ vs {vs_lbl_a} = {wrc_away_vs} ({_p4a:+.2f}pt)")
     else:
         factores.append(f"❓ Visitante: wRC+ vs {vs_lbl_a}: sin datos")
     if _p4h is not None:
-        pts_home += _p4h
+        pts_home += _p4h; pts_home_f5 += _p4h
         _ic = "✅" if _p4h > 0 else ("🔴" if _p4h < 0 else "🟰")
         factores.append(f"{_ic} Local: wRC+ vs {vs_lbl_h} = {wrc_home_vs} ({_p4h:+.2f}pt)")
     else:
@@ -3346,6 +3348,7 @@ def calcular_ventaja_partido(partido: dict, resumenes: dict, raw_global,
     if risp_h or risp_a:
         ph = _risp_pts(rk_h); pa = _risp_pts(rk_a)
         pts_home += ph; pts_away += pa
+        pts_home_f5 += ph; pts_away_f5 += pa
         lh = _risp_label(rk_h, n_risp); la = _risp_label(rk_a, n_risp)
         woba_h = risp_h.get("wOBA", "—") if risp_h else "—"
         woba_a = risp_a.get("wOBA", "—") if risp_a else "—"
@@ -3392,7 +3395,7 @@ def calcular_ventaja_partido(partido: dict, resumenes: dict, raw_global,
     pa_pit, la_pit = _pitcher_rec_pts(rec_a_pit)
 
     if ph_pit is not None:
-        pts_home += ph_pit
+        pts_home += ph_pit; pts_home_f5 += ph_pit
         _ic = "✅" if ph_pit > 0 else ("🔴" if ph_pit < 0 else "🟰")
         factores.append(f"{_ic} Local: récord equipo con {partido.get('home_pitcher','starter')} = {lh_pit} ({ph_pit:+.2f}pt)")
     else:
@@ -3400,7 +3403,7 @@ def calcular_ventaja_partido(partido: dict, resumenes: dict, raw_global,
         factores.append(f"❓ Local: récord equipo con starter ({_lbl})")
 
     if pa_pit is not None:
-        pts_away += pa_pit
+        pts_away += pa_pit; pts_away_f5 += pa_pit
         _ic = "✅" if pa_pit > 0 else ("🔴" if pa_pit < 0 else "🟰")
         factores.append(f"{_ic} Visitante: récord equipo con {partido.get('away_pitcher','starter')} = {la_pit} ({pa_pit:+.2f}pt)")
     else:
@@ -3408,13 +3411,71 @@ def calcular_ventaja_partido(partido: dict, resumenes: dict, raw_global,
         factores.append(f"❓ Visitante: récord equipo con starter ({_lbl})")
 
     return {
-        "home":      home,
-        "away":      away,
-        "pts_home":  round(pts_home, 1),
-        "pts_away":  round(pts_away, 1),
-        "factores":  factores,
-        "home_name": TEAM_NAMES.get(home, home),
-        "away_name": TEAM_NAMES.get(away, away),
+        "home":        home,
+        "away":        away,
+        "pts_home":    round(pts_home, 1),
+        "pts_away":    round(pts_away, 1),
+        "pts_home_f5": round(pts_home_f5, 1),
+        "pts_away_f5": round(pts_away_f5, 1),
+        "factores":    factores,
+        "home_name":   TEAM_NAMES.get(home, home),
+        "away_name":   TEAM_NAMES.get(away, away),
+    }
+
+
+def _recomendaciones_bet(r: dict, records_cache: dict) -> dict:
+    """Genera recomendaciones de apuesta (ML, F5, Runline) a partir del resultado
+    de calcular_ventaja_partido y el cache de records de equipo."""
+
+    def _conf_icon(diff: float):
+        diff = abs(diff)
+        if diff >= 3.0:
+            return "Alta", "🔥"
+        if diff >= 1.5:
+            return "Media", "✅"
+        if diff >= 0.5:
+            return "Baja", "⚠️"
+        return None, ""
+
+    # ML
+    ml_diff = r["pts_home"] - r["pts_away"]
+    ml_conf, ml_icon = _conf_icon(ml_diff)
+    if ml_conf:
+        ml_team = r["home_name"] if ml_diff > 0 else r["away_name"]
+        ml_abbr = r["home"] if ml_diff > 0 else r["away"]
+    else:
+        ml_team = None
+        ml_abbr = None
+
+    # F5
+    f5_diff = r["pts_home_f5"] - r["pts_away_f5"]
+    f5_conf, f5_icon = _conf_icon(f5_diff)
+    if f5_conf:
+        f5_team = r["home_name"] if f5_diff > 0 else r["away_name"]
+    else:
+        f5_team = None
+
+    # Runline (-1.5): sólo si ML conf es Alta o Media Y margen_win_25d ≥ 2.0
+    rl_label = None
+    if ml_conf in ("Alta", "Media") and ml_abbr:
+        rec = records_cache.get(ml_abbr, {})
+        margen = rec.get("margen_win_25d")
+        if margen is not None:
+            try:
+                mv = float(str(margen).replace("+", "").split()[0])
+                if mv >= 2.0:
+                    rl_label = f"{ml_team} -1.5"
+            except (ValueError, IndexError):
+                pass
+
+    return {
+        "ml_team": ml_team,
+        "ml_conf": ml_conf,
+        "ml_icon": ml_icon,
+        "f5_team": f5_team,
+        "f5_conf": f5_conf,
+        "f5_icon": f5_icon,
+        "rl_label": rl_label,
     }
 
 
@@ -3592,6 +3653,10 @@ def tab_pronostico():
             ventaja = f"✈️ {r['away_name']}"
         else:
             ventaja = "⚖️ Parejo"
+        bet = _recomendaciones_bet(r, records_cache)
+        ml_str = f"{bet['ml_icon']} {bet['ml_team']} ({bet['ml_conf']})" if bet["ml_team"] else "—"
+        f5_str = f"{bet['f5_icon']} {bet['f5_team']} ({bet['f5_conf']})" if bet["f5_team"] else "—"
+        rl_str = bet["rl_label"] if bet["rl_label"] else "—"
         sum_rows.append({
             "Visitante":  r["away_name"],
             "Pts Vis.":   r["pts_away"],
@@ -3599,6 +3664,9 @@ def tab_pronostico():
             "Pts Loc.":   r["pts_home"],
             "Diferencia": round(diff, 1),
             "Ventaja":    ventaja,
+            "ML Rec.":    ml_str,
+            "F5 Rec.":    f5_str,
+            "Runline":    rl_str,
             "Hora":       p.get("hora", "—"),
         })
 
@@ -3676,6 +3744,33 @@ def tab_pronostico():
                     f"</div>",
                     unsafe_allow_html=True,
                 )
+
+            # 🎯 Recomendaciones de apuesta
+            bet = _recomendaciones_bet(r, records_cache)
+            st.markdown("---")
+            st.markdown("**🎯 Recomendaciones de apuesta**")
+            rcol1, rcol2, rcol3 = st.columns(3)
+            with rcol1:
+                st.markdown("**ML (ganador)**")
+                if bet["ml_team"]:
+                    st.markdown(f"{bet['ml_icon']} {bet['ml_team']}")
+                    st.caption(f"Confianza: {bet['ml_conf']}")
+                else:
+                    st.markdown("— Sin ventaja clara")
+            with rcol2:
+                st.markdown("**F5 (primeros 5)**")
+                if bet["f5_team"]:
+                    st.markdown(f"{bet['f5_icon']} {bet['f5_team']}")
+                    st.caption(f"Confianza: {bet['f5_conf']}")
+                else:
+                    st.markdown("— Sin ventaja clara")
+            with rcol3:
+                st.markdown("**Runline (-1.5)**")
+                if bet["rl_label"]:
+                    st.markdown(f"✅ {bet['rl_label']}")
+                    st.caption("ML Alta/Media + margen ≥ 2.0 c/j")
+                else:
+                    st.markdown("— No aplica")
 
 
 
