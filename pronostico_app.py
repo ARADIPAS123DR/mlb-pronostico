@@ -244,6 +244,20 @@ def _extraer_apariciones_equipo(raw: pd.DataFrame, team: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
+    # Excluir jugadores de posición: en era DH universal los pitchers reales
+    # tienen 0 PA como bateadores. Si aparecen como batter con >= 3 PA en el
+    # dataset completo (raw), son jugadores de campo y se excluyen del bullpen.
+    if "batter" in raw.columns and "events" in raw.columns:
+        _bat_pa = (
+            raw[raw["events"].isin(PA_EVENTS)]
+            .groupby("batter")["events"].count()
+        )
+        _position_players = set(_bat_pa[_bat_pa >= 3].index)
+        if _position_players:
+            df = df[~df["pitcher"].isin(_position_players)].copy()
+    if df.empty:
+        return pd.DataFrame()
+
     records = []
     for (pid, gdate, gpk), grp in df.groupby(["pitcher", "game_date", "game_pk"]):
         events = grp["events"].dropna()
@@ -529,8 +543,8 @@ def tab_bullpen_individual():
     st.markdown("#### 📈 Tendencia FIP del Bullpen — últimos 45 días")
     st.caption("FIP diario calculado con todas las apariciones del bullpen en cada fecha. Línea suavizada = promedio móvil 5 días.")
 
-    with st.spinner("Cargando 45 días para tendencia FIP..."):
-        raw_45d = cargar_statcast_global(dias=45)
+    with st.spinner("Cargando 30 días para tendencia FIP..."):
+        raw_45d = cargar_statcast_global(dias=30)
         df_apps_45 = _extraer_apariciones_equipo(raw_45d, team) if not raw_45d.empty else pd.DataFrame()
 
     if not df_apps_45.empty:
@@ -1011,19 +1025,30 @@ def cargar_fb_velo_gamelog(pitcher_id: int, start_dt: str, end_dt: str) -> dict:
 def cargar_records_equipo(team_id: int, season: int = None) -> dict:
     """
     Retorna dict con:
-      'season':   'W-L'
-      'last10':   'W-L'
-      'home10':   'W-L'
-      'away10':   'W-L'
-      'weekday':  {0: 'W-L', ..., 6: 'W-L'}   (0=Mon … 6=Sun)
-    Fuente: MLB Stats API schedule con hydrate=decisions.
+      'season':         'W-L'
+      'last10':         'W-L'
+      'home10':         'W-L'
+      'away10':         'W-L'
+      'weekday':        {0: 'W-L', ..., 6: 'W-L'}   (0=Mon … 6=Sun)
+      'extra_innings':  'W-L'  — record en juegos de extra innings (temporada)
+      'margen_win_25d': str    — promedio margen victorias ult. 25 días (e.g. "+3.2")
+      'margen_loss_25d':str    — promedio margen derrotas ult. 25 días (e.g. "-2.8")
+      'blown_7th_60d':  str    — "X veces" perdió ventaja entrando al 7° (ult. 60 días)
+      'game_results':   list   — [{gamePk, won}] para cruzar con gamelog del pitcher
+    Fuente: MLB Stats API schedule con hydrate=decisions,team,linescore.
     """
     if season is None:
-        season = 2026
+        season = date.today().year
     today = date.today()
-    empty = {"season": "—", "last10": "—", "home10": "—", "away10": "—", "weekday": {}}
+    empty = {
+        "season": "—", "last10": "—", "home10": "—", "away10": "—", "weekday": {},
+        "extra_innings": "—", "margen_win_25d": "—", "margen_loss_25d": "—",
+        "blown_7th_60d": "—", "game_results": [],
+    }
 
-    # Solo usar la temporada indicada (2026), sin fallback a año anterior
+    cutoff_25 = today - timedelta(days=25)
+    cutoff_60 = today - timedelta(days=60)
+
     yr = season
     for _attempt in range(1):
         try:
@@ -1043,21 +1068,39 @@ def cargar_records_equipo(team_id: int, season: int = None) -> dict:
                         continue
                     gdate = g.get("gameDate", "")
                     try:
-                        gdt   = datetime.fromisoformat(gdate.replace("Z", "+00:00"))
-                        wday  = gdt.weekday()         # 0=Mon … 6=Sun
+                        gdt  = datetime.fromisoformat(gdate.replace("Z", "+00:00"))
+                        wday = gdt.weekday()         # 0=Mon … 6=Sun
+                        gd   = gdt.date()
                     except Exception:
                         continue
-                    h_id  = g["teams"]["home"]["team"].get("id")
-                    a_id  = g["teams"]["away"]["team"].get("id")
+                    h_id    = g["teams"]["home"]["team"].get("id")
                     h_score = g["teams"]["home"].get("score", 0) or 0
                     a_score = g["teams"]["away"].get("score", 0) or 0
                     is_home = (h_id == team_id)
                     if is_home:
-                        won = h_score > a_score
+                        won        = h_score > a_score
+                        score_diff = h_score - a_score
                     else:
-                        won = a_score > h_score
+                        won        = a_score > h_score
+                        score_diff = a_score - h_score
+
+                    # Linescore: per-inning data
+                    innings  = g.get("linescore", {}).get("innings", [])
+                    n_inn    = len(innings)
+                    extra    = n_inn > 9
+
+                    # Blown lead entering 7th: led after 6 innings complete but lost
+                    blown = False
+                    if n_inn >= 7 and not won:
+                        h6 = sum((inn.get("home") or {}).get("runs", 0) or 0 for inn in innings[:6])
+                        a6 = sum((inn.get("away") or {}).get("runs", 0) or 0 for inn in innings[:6])
+                        blown = (h6 > a6) if is_home else (a6 > h6)
+
+                    game_pk = g.get("gamePk")
                     games.append({
-                        "date": gdt, "home": is_home, "won": won, "wday": wday
+                        "date": gdt, "date_d": gd, "home": is_home, "won": won,
+                        "wday": wday, "score_diff": score_diff,
+                        "extra": extra, "blown": blown, "gamePk": game_pk,
                     })
 
             if not games:
@@ -1091,15 +1134,80 @@ def cargar_records_equipo(team_id: int, season: int = None) -> dict:
                     ww = sum(1 for g in wdg if g["won"])
                     wd_rec[wd] = f"{ww}-{len(wdg)-ww}"
 
+            # Extra innings record (temporada completa)
+            xi_g = [g for g in games if g["extra"]]
+            if xi_g:
+                xi_w = sum(1 for g in xi_g if g["won"])
+                extra_rec = f"{xi_w}-{len(xi_g)-xi_w}"
+            else:
+                extra_rec = "—"
+
+            # Márgenes últimos 25 días
+            g25      = [g for g in games if g["date_d"] >= cutoff_25]
+            wins_25  = [g["score_diff"] for g in g25 if g["won"]]
+            loss_25  = [g["score_diff"] for g in g25 if not g["won"]]
+            margen_win  = (f"+{sum(wins_25)/len(wins_25):.1f}"  if len(wins_25)  >= 3 else "—")
+            margen_loss = (f"{sum(loss_25)/len(loss_25):.1f}"   if len(loss_25)  >= 3 else "—")
+
+            # Blown leads desde 7° inning (últimos 60 días)
+            g60         = [g for g in games if g["date_d"] >= cutoff_60]
+            blown_count = sum(1 for g in g60 if g["blown"])
+            blown_total = len(g60)
+            blown_str   = (f"{blown_count}/{blown_total}G" if g60 else "—")
+
+            # Game results para cruzar con gamelog del pitcher
+            game_results = [{"gamePk": g["gamePk"], "won": g["won"]}
+                            for g in games if g["gamePk"]]
+
             return {
                 "season": season_rec, "last10": last10_rec,
                 "home10": home10_rec, "away10": away10_rec,
                 "weekday": wd_rec,
+                "extra_innings":  extra_rec,
+                "margen_win_25d": margen_win,
+                "margen_loss_25d": margen_loss,
+                "blown_7th_60d":  blown_str,
+                "game_results":   game_results,
             }
         except Exception:
             pass
 
     return empty
+
+
+# ── Récord del equipo cuando lanza un pitcher específico ──────────────────────
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cargar_record_equipo_pitcher(pitcher_id: int, team_id: int, season: int = None) -> str:
+    """
+    Retorna 'W-L' del equipo en los juegos que inició este pitcher en la temporada.
+    Cruza los gamePks del gamelog del pitcher con los resultados del equipo.
+    """
+    if season is None:
+        season = date.today().year
+    splits = _fetch_gamelog_raw(pitcher_id, season)
+    if not splits:
+        return "—"
+    # gamePks de salidas como starter
+    starter_pks = set()
+    for sp in splits:
+        if int(sp.get("stat", {}).get("gamesStarted", 0)) >= 1:
+            pk = sp.get("game", {}).get("gamePk")
+            if pk:
+                starter_pks.add(pk)
+    if not starter_pks:
+        return "—"
+    # Cruzar con resultados del equipo (ya cacheados)
+    rec = cargar_records_equipo(team_id, season)
+    game_results = rec.get("game_results", [])
+    w = l = 0
+    for gr in game_results:
+        if gr["gamePk"] in starter_pks:
+            if gr["won"]:
+                w += 1
+            else:
+                l += 1
+    return f"{w}-{l}" if (w + l) > 0 else "—"
 
 
 # ── Récord head-to-head entre dos equipos ─────────────────────────────────────
@@ -1110,7 +1218,7 @@ def cargar_h2h(team_id_home: int, team_id_away: int, season: int = None) -> str:
     Retorna 'W-L' del equipo HOME vs equipo AWAY en la temporada.
     """
     if season is None:
-        season = 2026
+        season = date.today().year
     today = date.today()
     yr = season
     try:
@@ -1283,7 +1391,7 @@ def cargar_record_vs_hand(team_id: int, pitcher_hand: str, season: int = None) -
     Obtiene el schedule y filtra por mano del probable pitcher (o starter registrado).
     """
     if season is None:
-        season = 2026
+        season = date.today().year
     today = date.today()
     yr = season
     try:
@@ -1326,72 +1434,10 @@ def cargar_record_vs_hand(team_id: int, pitcher_hand: str, season: int = None) -
     return "—"
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def cargar_record_equipo_con_pitcher(pitcher_id: int, team_id: int, season: int = None) -> str:
-    """
-    Retorna 'W-L' del equipo en partidos de temporada regular donde pitcher_id fue el abridor.
-    Usa el gamelog del pitcher (MLB Stats API) cruzado con el schedule del equipo.
-    """
-    if not pitcher_id or not team_id:
-        return "—"
-    if season is None:
-        season = 2026
-    today = date.today()
-    try:
-        # 1. Gamelog del pitcher → set de gamePks donde fue abridor
-        gl_url = (
-            f"https://statsapi.mlb.com/api/v1/people/{pitcher_id}/stats"
-            f"?stats=gameLog&group=pitching&season={season}&gameType=R"
-        )
-        r1 = _req_http.get(gl_url, timeout=12)
-        r1.raise_for_status()
-        started_pks = set()
-        for block in r1.json().get("stats", []):
-            for split in block.get("splits", []):
-                if int((split.get("stat") or {}).get("gamesStarted", 0)) >= 1:
-                    gpk = (split.get("game") or {}).get("gamePk")
-                    if gpk:
-                        started_pks.add(int(gpk))
-
-        if not started_pks:
-            return "—"
-
-        # 2. Schedule del equipo con scores → cruzar por gamePk
-        sched_url = (
-            "https://statsapi.mlb.com/api/v1/schedule"
-            f"?sportId=1&teamId={team_id}&season={season}&gameType=R"
-            f"&startDate={season}-01-01&endDate={today}"
-            "&hydrate=team,linescore"
-        )
-        r2 = _req_http.get(sched_url, timeout=15)
-        r2.raise_for_status()
-        wins = losses = 0
-        for db in r2.json().get("dates", []):
-            for g in db.get("games", []):
-                if int(g.get("gamePk", 0)) not in started_pks:
-                    continue
-                if g.get("status", {}).get("abstractGameState") != "Final":
-                    continue
-                h_id    = g["teams"]["home"]["team"].get("id")
-                h_score = g["teams"]["home"].get("score", 0) or 0
-                a_score = g["teams"]["away"].get("score", 0) or 0
-                is_home = (h_id == team_id)
-                if is_home:
-                    if h_score > a_score: wins += 1
-                    else: losses += 1
-                else:
-                    if a_score > h_score: wins += 1
-                    else: losses += 1
-
-        return f"{wins}-{losses}" if (wins + losses) > 0 else "—"
-    except Exception:
-        return "—"
-
-
 # ── Clima del partido (Open-Meteo, sin API key) ───────────────────────────────
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cargar_clima_partido(team_abbr: str, game_dt_utc: str) -> dict | None:
+def cargar_clima_partido(team_abbr: str, game_dt_utc: str) -> dict:
     """
     Retorna dict con temp_c, temp_f, humidity, precip_prob, wind_kph,
     wind_deg, wind_rel_label, wind_emoji.
@@ -1491,92 +1537,6 @@ def cargar_clima_partido(team_abbr: str, game_dt_utc: str) -> dict | None:
         return None
 
 
-# ── Momios FanDuel via The Odds API ──────────────────────────────────────────
-
-def cargar_momios_fanduel(api_key: str) -> dict:
-    """
-    Retorna {home_name_lower: {'home_ml': int, 'away_ml': int, 'home_team': str, 'away_team': str}}
-    Usa The Odds API (the-odds-api.com). Fallback silencioso si falla.
-    """
-    if not api_key or len(api_key) < 10:
-        return {}
-    try:
-        url = (
-            "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/"
-            f"?apiKey={api_key}&regions=us&markets=h2h&bookmakers=fanduel&oddsFormat=american"
-        )
-        r = _req_http.get(url, timeout=10)
-        if r.status_code != 200:
-            return {}
-        result = {}
-        for game in r.json():
-            home = game.get("home_team", "")
-            away = game.get("away_team", "")
-            for bk in game.get("bookmakers", []):
-                if bk.get("key") != "fanduel":
-                    continue
-                for mkt in bk.get("markets", []):
-                    if mkt.get("key") != "h2h":
-                        continue
-                    odds = {o["name"]: o["price"] for o in mkt.get("outcomes", [])}
-                    home_ml = odds.get(home)
-                    away_ml = odds.get(away)
-                    if home_ml is not None and away_ml is not None:
-                        key = home.lower().strip()
-                        result[key] = {
-                            "home_team": home, "away_team": away,
-                            "home_ml": int(home_ml), "away_ml": int(away_ml),
-                        }
-        return result
-    except Exception:
-        return {}
-
-
-def _ml_to_prob(ml: int) -> float:
-    """Convierte moneyline americano a probabilidad implícita (sin vig)."""
-    if ml > 0:
-        return 100 / (ml + 100)
-    else:
-        return abs(ml) / (abs(ml) + 100)
-
-
-def _prob_to_ml(p: float) -> str:
-    """Convierte probabilidad a moneyline americano formateado."""
-    if p <= 0 or p >= 1:
-        return "—"
-    if p >= 0.5:
-        ml = round(-(p / (1 - p)) * 100)
-        return f"{ml}"
-    else:
-        ml = round((1 - p) / p * 100)
-        return f"+{ml}"
-
-
-def _fmt_ml(ml: int) -> str:
-    return f"+{ml}" if ml > 0 else str(ml)
-
-
-def _match_momio(momios: dict, home_name: str, away_name: str) -> dict:
-    """
-    Busca el momio que corresponde al partido por nombre de equipo.
-    Retorna {} si no encuentra.
-    """
-    if not momios:
-        return {}
-    h_low = home_name.lower().strip()
-    a_low = away_name.lower().strip()
-    for key, val in momios.items():
-        vh = val["home_team"].lower().strip()
-        va = val["away_team"].lower().strip()
-        if (h_low in vh or vh in h_low) and (a_low in va or va in a_low):
-            return val
-        if (a_low in vh or vh in a_low) and (h_low in va or va in h_low):
-            # invertido en la API
-            return {
-                "home_team": val["away_team"], "away_team": val["home_team"],
-                "home_ml": val["away_ml"], "away_ml": val["home_ml"],
-            }
-    return {}
 
 
 # ── Lineup confirmado (MLB Stats API) ────────────────────────────────────────
@@ -2436,7 +2396,8 @@ def tab_partidos_dia():  # noqa: C901
             f"<div style='width:{bar_pct}%;background:{bar_color};height:6px;border-radius:4px;'></div>"
             f"</div>", unsafe_allow_html=True)
 
-    def _starter_card(col, pitcher_name: str, pitcher_id, team_name: str, side_label: str):
+    def _starter_card(col, pitcher_name: str, pitcher_id, team_name: str, side_label: str,
+                      team_id=None):
         with col:
             st.markdown(f"**{team_name} ({side_label})**")
             if pitcher_name == "Por confirmar":
@@ -2448,7 +2409,14 @@ def tab_partidos_dia():  # noqa: C901
 
             hand     = pitcher_hands.get(pitcher_id, "R")
             hand_lbl = "Zurdo" if hand == "L" else "Derecho"
-            st.markdown(f"*{hand_lbl}*")
+            # Record del equipo cuando lanza este pitcher
+            _rec_pitcher = "—"
+            if team_id:
+                try:
+                    _rec_pitcher = cargar_record_equipo_pitcher(pitcher_id, team_id)
+                except Exception:
+                    pass
+            st.markdown(f"*{hand_lbl}* | Rec. equipo con él: **{_rec_pitcher}**")
 
             r_dia = rank_dia_lookup.get(pitcher_id)
             r_mes = rank_mes_lookup.get(pitcher_id)
@@ -2554,6 +2522,13 @@ def tab_partidos_dia():  # noqa: C901
                     _sos_tids.add(_tid_tmp)
         _sos_map: dict = {_t: cargar_sos_equipo(_t) for _t in _sos_tids}
 
+    def _sos_label(v):
+        if v is None: return "—"
+        s = f"{v:.3f}"
+        if v >= 0.520:   return f"{s} 🔴"
+        elif v >= 0.500: return f"{s} 🟡"
+        else:            return f"{s} 🟢"
+
     # ═══════════════════════════════════════════════════════════════════════════
     # EXPANDER POR PARTIDO
     # ═══════════════════════════════════════════════════════════════════════════
@@ -2642,17 +2617,17 @@ def tab_partidos_dia():  # noqa: C901
                     _g7   = _sos.get("g_7d",  0)
                     _g14  = _sos.get("g_14d", 0)
                     _rv5  = _sos.get("rec_vs_500", "—")
-                    def _sos_label(v):
-                        if v is None: return "—"
-                        s = f"{v:.3f}"
-                        if v >= 0.520:   return f"{s} 🔴"
-                        elif v >= 0.500: return f"{s} 🟡"
-                        else:            return f"{s} 🟢"
+                    _xi   = _rec.get("extra_innings",  "—")
+                    _mw   = _rec.get("margen_win_25d", "—")
+                    _ml   = _rec.get("margen_loss_25d","—")
+                    _bl   = _rec.get("blown_7th_60d",  "—")
                     st.markdown(
                         f"**{_tname}**  \n"
                         f"Temporada: `{_s}` | Últ.10: `{_l10}`  \n"
                         f"Casa(10): `{_h10}` | Visita(10): `{_a10}`  \n"
                         f"Vs {_hand_lbl}: `{_rvh}` | {_wday_lbl}: `{_wdrec}`  \n"
+                        f"Extra innings: `{_xi}` | Blown 7° (60d): `{_bl}`  \n"
+                        f"Margen vict. (25d): `{_mw}` | Margen der. (25d): `{_ml}`  \n"
                         f"SOS-30d ({_g30}G): **{_sos_label(_s30v)}** | "
                         f"Vs .500+ (46d): `{_rv5}`  \n"
                         f"SOS fut-7d ({_g7}G): **{_sos_label(_s7v)}** | "
@@ -2666,8 +2641,8 @@ def tab_partidos_dia():  # noqa: C901
             # ── Iniciadores ─────────────────────────────────────────────────
             st.markdown("#### ⚾ Pitchers Iniciadores")
             _ci1, _ci2 = st.columns(2)
-            _starter_card(_ci1, p["away_pitcher"], a_pid, a_name, "Visitante")
-            _starter_card(_ci2, p["home_pitcher"], h_pid, h_name, "Local")
+            _starter_card(_ci1, p["away_pitcher"], a_pid, a_name, "Visitante", team_id=_a_tid)
+            _starter_card(_ci2, p["home_pitcher"], h_pid, h_name, "Local",     team_id=_h_tid)
 
             st.divider()
 
@@ -3458,23 +3433,6 @@ def tab_pronostico():
         key="pronostico_fecha",
     )
 
-    # ── API Key FanDuel — lee de secrets si está disponible ───────────────────
-    _key_from_secrets = st.secrets.get("ODDS_API_KEY", "") if hasattr(st, "secrets") else ""
-    with st.expander("⚙️ Configurar odds FanDuel (The Odds API)", expanded=not bool(_key_from_secrets)):
-        if _key_from_secrets:
-            st.caption("✅ API Key cargada desde secrets.")
-            odds_api_key = _key_from_secrets
-        else:
-            odds_api_key = st.text_input(
-                "API Key (the-odds-api.com — tier gratuito 500 req/mes)",
-                type="password",
-                key="odds_api_key",
-                help="Regístrate gratis en the-odds-api.com para obtener tu key"
-            )
-
-    with st.spinner("Cargando momios FanDuel..."):
-        momios_fd = cargar_momios_fanduel(odds_api_key) if odds_api_key else {}
-
     with st.spinner("Cargando partidos del día..."):
         partidos = cargar_partidos_mlb(fecha_sel)
 
@@ -3589,9 +3547,9 @@ def tab_pronostico():
 
             # Récord del equipo con cada pitcher abridor
             if h_pid and h_tid and h_pid not in pitcher_rec_cache:
-                pitcher_rec_cache[h_pid] = cargar_record_equipo_con_pitcher(h_pid, h_tid)
+                pitcher_rec_cache[h_pid] = cargar_record_equipo_pitcher(h_pid, h_tid)
             if a_pid and a_tid and a_pid not in pitcher_rec_cache:
-                pitcher_rec_cache[a_pid] = cargar_record_equipo_con_pitcher(a_pid, a_tid)
+                pitcher_rec_cache[a_pid] = cargar_record_equipo_pitcher(a_pid, a_tid)
 
     # ── Calcular y mostrar pronóstico por partido ────────────────────────────
     resultados = []
@@ -3634,38 +3592,14 @@ def tab_pronostico():
             ventaja = f"✈️ {r['away_name']}"
         else:
             ventaja = "⚖️ Parejo"
-        _mom = _match_momio(momios_fd, r["home_name"], r["away_name"])
-        _ml_h = _fmt_ml(_mom["home_ml"]) if _mom else "—"
-        _ml_a = _fmt_ml(_mom["away_ml"]) if _mom else "—"
-        _prob_h = _ml_to_prob(_mom["home_ml"]) if _mom else None
-        _prob_a = _ml_to_prob(_mom["away_ml"]) if _mom else None
-        # Normalizar (quitar vig)
-        if _prob_h and _prob_a:
-            _tot = _prob_h + _prob_a
-            _prob_h_norm = _prob_h / _tot
-            _prob_a_norm = _prob_a / _tot
-        else:
-            _prob_h_norm = _prob_a_norm = None
-        # Prob modelo
-        _tot_pts = r["pts_home"] + r["pts_away"]
-        _mod_h = r["pts_home"] / _tot_pts if _tot_pts > 0 else 0.5
-        _mod_a = r["pts_away"] / _tot_pts if _tot_pts > 0 else 0.5
-        # Valor vs mercado
-        if _prob_h_norm:
-            _valor = "📈 Valor local" if _mod_h > _prob_h_norm + 0.05 else ("📉 Valor visita" if _mod_a > _prob_a_norm + 0.05 else "⚖️ En línea")
-        else:
-            _valor = "—"
         sum_rows.append({
-            "Visitante":     r["away_name"],
-            "ML Vis.":       _ml_a,
-            "Pts Vis.":      r["pts_away"],
-            "Local":         r["home_name"],
-            "ML Loc.":       _ml_h,
-            "Pts Loc.":      r["pts_home"],
-            "Diferencia":    round(diff, 1),
-            "Ventaja":       ventaja,
-            "FD Valor":      _valor,
-            "Hora":          p.get("hora", "—"),
+            "Visitante":  r["away_name"],
+            "Pts Vis.":   r["pts_away"],
+            "Local":      r["home_name"],
+            "Pts Loc.":   r["pts_home"],
+            "Diferencia": round(diff, 1),
+            "Ventaja":    ventaja,
+            "Hora":       p.get("hora", "—"),
         })
 
     st.dataframe(
@@ -3706,31 +3640,6 @@ def tab_pronostico():
                 f"{ventaja_str}</div>",
                 unsafe_allow_html=True,
             )
-
-            # Odds FanDuel
-            _mom_e = _match_momio(momios_fd, r["home_name"], r["away_name"])
-            if _mom_e:
-                _mh = _fmt_ml(_mom_e["home_ml"]); _ma = _fmt_ml(_mom_e["away_ml"])
-                _ph = _ml_to_prob(_mom_e["home_ml"]); _pa = _ml_to_prob(_mom_e["away_ml"])
-                _tot_p = _ph + _pa
-                _ph_n = _ph / _tot_p; _pa_n = _pa / _tot_p
-                _tot_pts_e = r["pts_home"] + r["pts_away"]
-                _mh_pct = r["pts_home"] / _tot_pts_e if _tot_pts_e > 0 else 0.5
-                _ma_pct = r["pts_away"] / _tot_pts_e if _tot_pts_e > 0 else 0.5
-                _v_h = _mh_pct - _ph_n; _v_a = _ma_pct - _pa_n
-                st.markdown(
-                    f"<div style='background:#1a1a2e;color:#eee;padding:10px 16px;border-radius:8px;"
-                    f"margin-bottom:10px;font-family:monospace;'>"
-                    f"<b>🎰 FanDuel ML</b> &nbsp;|&nbsp; "
-                    f"✈️ {r['away_name']}: <b>{_ma}</b> ({_pa_n*100:.0f}%) &nbsp;|&nbsp; "
-                    f"🏠 {r['home_name']}: <b>{_mh}</b> ({_ph_n*100:.0f}%) &nbsp;|&nbsp; "
-                    f"Modelo: ✈️{_ma_pct*100:.0f}% vs 🏠{_mh_pct*100:.0f}% &nbsp;|&nbsp; "
-                    f"Valor: {'📈 LOCAL +'+str(round(_v_h*100))+'%' if _v_h > 0.05 else ('📈 VISITA +'+str(round(_v_a*100))+'%' if _v_a > 0.05 else '⚖️ En línea')}"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.caption("🎰 FanDuel: sin datos de momios")
 
             col1, col2 = st.columns(2)
             with col1:
@@ -4030,24 +3939,76 @@ def main():
         st.error("pybaseball no instalado. Ejecuta: pip install pybaseball")
         st.stop()
 
+    # ── Panel de estado en sidebar ────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### Estado del sistema")
+        # MLB Stats API
+        try:
+            _r = _req_http.get(
+                "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date="
+                + date.today().strftime("%Y-%m-%d"),
+                timeout=5,
+            )
+            _mlb_ok = _r.status_code == 200
+        except Exception:
+            _mlb_ok = False
+        st.markdown("MLB Stats API: " + ("🟢 OK" if _mlb_ok else "🔴 Sin respuesta"))
+
+        # Statcast / pybaseball
+        try:
+            _test_sc = cargar_statcast_global(dias=2)
+            _sc_ok = not _test_sc.empty
+        except Exception:
+            _sc_ok = False
+        st.markdown("Statcast (pybaseball): " + ("🟢 OK" if _sc_ok else "🔴 Sin datos"))
+
+        # Clima API
+        _wx_key = st.secrets.get("OPENWEATHER_API_KEY", "") if hasattr(st, "secrets") else ""
+        st.markdown("Weather API key: " + ("🟢 Configurada" if _wx_key else "🟡 No configurada"))
+
+        st.caption(f"Temporada activa: **{date.today().year}**")
+        st.caption(f"Versión pybaseball: **{pybaseball.__version__}**")
+        st.caption(f"Versión streamlit: **{st.__version__}**")
+
+    # ── Tabs con protección individual ────────────────────────────────────────
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["🔥 Bullpen Equipo", "🗺️ Bullpen Liga", "📅 Partidos del Día", "🔮 Pronóstico", "📊 Bullpen Usage"]
     )
 
     with tab1:
-        tab_bullpen_individual()
+        try:
+            tab_bullpen_individual()
+        except Exception as _e:
+            st.error(f"Error en Bullpen Equipo: {_e}")
+            st.code(traceback.format_exc(), language="python")
 
     with tab2:
-        tab_bullpen_liga()
+        try:
+            tab_bullpen_liga()
+        except Exception as _e:
+            st.error(f"Error en Bullpen Liga: {_e}")
+            st.code(traceback.format_exc(), language="python")
 
     with tab3:
-        tab_partidos_dia()
+        try:
+            tab_partidos_dia()
+        except Exception as _e:
+            st.error(f"Error en Partidos del Día: {_e}")
+            st.code(traceback.format_exc(), language="python")
 
     with tab4:
-        tab_pronostico()
+        try:
+            tab_pronostico()
+        except Exception as _e:
+            st.error(f"Error en Pronóstico: {_e}")
+            st.code(traceback.format_exc(), language="python")
 
     with tab5:
-        tab_bullpen_usage()
+        try:
+            tab_bullpen_usage()
+        except Exception as _e:
+            st.error(f"Error en Bullpen Usage: {_e}")
+            st.code(traceback.format_exc(), language="python")
 
 
 if __name__ == "__main__":
